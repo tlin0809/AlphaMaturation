@@ -1,0 +1,2534 @@
+---
+title: "Alpha Cell Maturation Marker Scoring Workflow"
+author: "Traye Lin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE)
+```
+
+---
+
+# Overview
+
+This workflow extends the existing alpha cell maturation analysis without
+re-running the upstream scRNA-seq preprocessing, integration, or alpha cell
+subsetting. The starting point is the integrated alpha Seurat object produced by
+`isletToolkit_AlphaMaturation_Workflow.Rmd`.
+
+The workflow is intentionally organized as resumable steps. Each step writes
+tables, objects, logs, and figures into a defined output location so that later
+analysis can be audited and restarted without guessing which files were used.
+
+Current implementation status:
+
+- Step 1: rebuild project state.
+- Step 2: prepare analysis-ready alpha inputs.
+- Step 3: build marker scoring framework.
+- Step 4: add regulatory support evidence.
+- Step 5: generate marker review package.
+- Step 6: validate candidate marker expression.
+- Step 7: nominate follow-up marker candidates.
+- Step 8: finalize reproducible handoff package.
+- Step 3 marker scoring will weight expression robustness and regulatory
+  support more heavily than other evidence classes.
+
+---
+
+# Step 1 - Rebuild Project State
+
+Step 1 checks the current project state and records it before downstream marker
+scoring begins. It does not modify the existing Seurat objects. It only creates
+a new output structure, checks expected files, loads the integrated alpha object
+when available, validates the basic biological labels, and saves summary files
+for reproducibility.
+
+```{r step1-libraries}
+# Core packages used in Step 1. Packages are checked first and loaded only when
+# available so the state report can still identify missing dependencies cleanly.
+required_pkgs <- c(
+  "Seurat",
+  "SeuratObject",
+  "Matrix",
+  "dplyr",
+  "tibble",
+  "tidyr",
+  "readr",
+  "stringr"
+)
+
+optional_pkgs <- c(
+  "ggplot2",
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "RcisTarget",
+  "igraph",
+  "ggraph"
+)
+
+get_package_status <- function(packages, required = TRUE) {
+  tibble::tibble(
+    package  = packages,
+    required = required,
+    available = vapply(packages, requireNamespace, logical(1), quietly = TRUE),
+    version = vapply(
+      packages,
+      function(pkg) {
+        if (!requireNamespace(pkg, quietly = TRUE)) return(NA_character_)
+        as.character(utils::packageVersion(pkg))
+      },
+      character(1)
+    )
+  )
+}
+
+package_status <- dplyr::bind_rows(
+  get_package_status(required_pkgs, required = TRUE),
+  get_package_status(optional_pkgs, required = FALSE)
+)
+
+missing_required <- package_status |>
+  dplyr::filter(required, !available) |>
+  dplyr::pull(package)
+
+if (length(missing_required) > 0) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_required, collapse = ", "),
+    ". Install these before running Step 1."
+  )
+}
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+```
+
+```{r step1-config}
+# ---- Project paths ----
+# The workflow stays anchored to the folder containing this Rmd so it continues
+# to work after the project files are moved into AlphaMaturation/.
+current_input <- tryCatch(knitr::current_input(), error = function(e) NULL)
+project_root <- if (!is.null(current_input) && nzchar(current_input)) {
+  normalizePath(dirname(current_input), winslash = "/", mustWork = TRUE)
+} else {
+  normalizePath(".", winslash = "/", mustWork = TRUE)
+}
+
+output_root <- file.path(project_root, "alpha_maturation_outputs")
+
+output_dirs <- list(
+  root          = output_root,
+  state         = file.path(output_root, "00_project_state"),
+  inputs        = file.path(output_root, "01_inputs"),
+  marker_scores = file.path(output_root, "02_marker_scoring"),
+  de            = file.path(output_root, "03_differential_expression"),
+  regulatory    = file.path(output_root, "04_regulatory_support"),
+  figures       = file.path(output_root, "05_figures"),
+  tables        = file.path(output_root, "06_tables"),
+  objects       = file.path(output_root, "objects"),
+  logs          = file.path(output_root, "logs")
+)
+
+ensure_dir <- function(path) {
+  if (!dir.exists(path)) {
+    dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  }
+  normalizePath(path, winslash = "/", mustWork = TRUE)
+}
+
+output_dirs <- lapply(output_dirs, ensure_dir)
+
+# ---- Expected upstream files ----
+# The existing Rmd owns these objects. This workflow consumes them and writes new
+# analysis state into alpha_maturation_outputs/.
+resolve_project_file <- function(...) {
+  relative_path <- file.path(...)
+  parent_root <- normalizePath(file.path(project_root, ".."), winslash = "/", mustWork = TRUE)
+
+  candidates <- c(
+    file.path(project_root, relative_path),
+    file.path(parent_root, relative_path)
+  )
+
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) > 0) {
+    return(normalizePath(existing[[1]], winslash = "/", mustWork = TRUE))
+  }
+
+  normalizePath(candidates[[1]], winslash = "/", mustWork = FALSE)
+}
+
+input_registry <- tibble::tribble(
+  ~input_id, ~label, ~path, ~required_for_step1, ~expected_object,
+  "alpha_integrated", "Integrated alpha subset",
+    resolve_project_file("output", "human_combined_alpha.rds"), TRUE, "Seurat",
+  "combined_labeled", "Integrated labeled islet object",
+    resolve_project_file("output", "human_combined_integrated_labeled.rds"), FALSE, "Seurat",
+  "fetal_labeled", "Fetal labeled object",
+    resolve_project_file("output", "HI_fetal_labeled.rds"), FALSE, "Seurat",
+  "child_labeled", "Child labeled object",
+    resolve_project_file("output", "HI_child_labeled.rds"), FALSE, "Seurat",
+  "adult_labeled", "Adult labeled object",
+    resolve_project_file("output", "HI_adult_labeled.rds"), FALSE, "Seurat"
+)
+
+# ---- Developmental stage order ----
+# Keep the biological order explicit because all later transition, trend, and
+# scoring calculations depend on this ordering.
+alpha_stage_levels <- c("Fetal alpha", "Child alpha", "Adult alpha")
+
+# ---- Marker scoring weights reserved for Step 3 ----
+# Expression robustness and regulatory support receive the largest weights per
+# project direction. Later steps will calculate each component separately and
+# combine them only after all evidence tables pass validation.
+marker_score_weights <- tibble::tribble(
+  ~score_component, ~weight, ~rationale,
+  "expression_robustness", 0.30,
+    "Prioritize markers consistently detected across cells within each stage.",
+  "regulatory_support", 0.30,
+    "Prioritize markers supported by TF motif, module, or network evidence.",
+  "stage_specificity", 0.20,
+    "Capture developmental contrast between fetal, child, and adult alpha cells.",
+  "effect_size", 0.15,
+    "Retain biological magnitude from pairwise differential expression.",
+  "detectability", 0.05,
+    "Favor genes measurable enough for validation without over-weighting abundance."
+)
+
+if (abs(sum(marker_score_weights$weight) - 1) > 1e-8) {
+  stop("Marker scoring weights must sum to 1.0 before Step 3 is implemented.")
+}
+```
+
+```{r step1-helpers}
+write_step1_csv <- function(data, filename) {
+  readr::write_csv(data, file.path(output_dirs$state, filename))
+}
+
+write_step1_lines <- function(lines, filename) {
+  writeLines(lines, con = file.path(output_dirs$state, filename))
+}
+
+summarize_input_files <- function(registry) {
+  registry |>
+    dplyr::mutate(
+      exists = file.exists(path),
+      size_mb = dplyr::if_else(
+        exists,
+        round(file.info(path)$size / 1024^2, 3),
+        NA_real_
+      ),
+      modified_time = dplyr::if_else(
+        exists,
+        as.character(file.info(path)$mtime),
+        NA_character_
+      )
+    )
+}
+
+summarize_seurat_object <- function(seurat_obj) {
+  tibble::tibble(
+    metric = c(
+      "object_class",
+      "n_genes",
+      "n_cells",
+      "default_assay",
+      "assays",
+      "reductions",
+      "metadata_columns"
+    ),
+    value = c(
+      paste(class(seurat_obj), collapse = ";"),
+      as.character(nrow(seurat_obj)),
+      as.character(ncol(seurat_obj)),
+      SeuratObject::DefaultAssay(seurat_obj),
+      paste(SeuratObject::Assays(seurat_obj), collapse = ";"),
+      paste(names(seurat_obj@reductions), collapse = ";"),
+      paste(colnames(seurat_obj@meta.data), collapse = ";")
+    )
+  )
+}
+
+summarize_stage_counts <- function(seurat_obj, expected_levels) {
+  stage_counts <- tibble::tibble(
+    alpha_stage = as.character(SeuratObject::Idents(seurat_obj))
+  ) |>
+    dplyr::count(alpha_stage, name = "n_cells") |>
+    dplyr::mutate(
+      expected_stage = alpha_stage %in% expected_levels
+    ) |>
+    dplyr::mutate(
+      alpha_stage_order = factor(alpha_stage, levels = expected_levels)
+    ) |>
+    dplyr::arrange(alpha_stage_order, alpha_stage) |>
+    dplyr::select(-alpha_stage_order)
+
+  missing_stages <- setdiff(expected_levels, as.character(stage_counts$alpha_stage))
+  unexpected_stages <- setdiff(as.character(stage_counts$alpha_stage), expected_levels)
+
+  list(
+    stage_counts      = stage_counts,
+    missing_stages    = missing_stages,
+    unexpected_stages = unexpected_stages
+  )
+}
+
+validate_alpha_state <- function(seurat_obj, expected_levels) {
+  object_summary <- summarize_seurat_object(seurat_obj)
+  stage_summary  <- summarize_stage_counts(seurat_obj, expected_levels)
+
+  warnings <- character()
+
+  # These checks are deliberately grouped because downstream scoring depends on
+  # all three conditions together: expected stage labels, an RNA assay for
+  # expression statistics, and non-empty stage groups for pairwise comparisons.
+  if (length(stage_summary$missing_stages) > 0) {
+    warnings <- c(
+      warnings,
+      paste(
+        "Missing expected alpha stage label(s):",
+        paste(stage_summary$missing_stages, collapse = ", ")
+      )
+    )
+  }
+
+  if (length(stage_summary$unexpected_stages) > 0) {
+    warnings <- c(
+      warnings,
+      paste(
+        "Unexpected identity label(s) found:",
+        paste(stage_summary$unexpected_stages, collapse = ", ")
+      )
+    )
+  }
+
+  if (!"RNA" %in% SeuratObject::Assays(seurat_obj)) {
+    warnings <- c(
+      warnings,
+      "RNA assay not found. Step 3 expression robustness should use the assay containing normalized expression."
+    )
+  }
+
+  if (!"orig.ident" %in% colnames(seurat_obj@meta.data)) {
+    warnings <- c(
+      warnings,
+      "orig.ident metadata column not found. Dataset-origin summaries may need another metadata field."
+    )
+  }
+
+  list(
+    object_summary = object_summary,
+    stage_counts   = stage_summary$stage_counts,
+    warnings       = warnings
+  )
+}
+```
+
+```{r step1-rebuild-state}
+input_status <- summarize_input_files(input_registry)
+
+write_step1_csv(package_status, "package_status.csv")
+write_step1_csv(input_status, "input_file_status.csv")
+write_step1_csv(marker_score_weights, "marker_score_weights_step3_reserved.csv")
+
+alpha_input_path <- input_registry |>
+  dplyr::filter(input_id == "alpha_integrated") |>
+  dplyr::pull(path)
+
+if (!file.exists(alpha_input_path)) {
+  write_step1_lines(
+    c(
+      "Step 1 did not load the alpha object because the expected RDS file was not found.",
+      paste("Expected path:", alpha_input_path),
+      "Run the upstream alpha subset section in isletToolkit_AlphaMaturation_Workflow.Rmd first."
+    ),
+    "step1_status.txt"
+  )
+
+  stop(
+    "Required alpha object is missing: ",
+    alpha_input_path,
+    ". Upstream preprocessing is unchanged; please generate this RDS before continuing."
+  )
+}
+
+human_combined_alpha <- readRDS(alpha_input_path)
+
+alpha_validation <- validate_alpha_state(
+  seurat_obj       = human_combined_alpha,
+  expected_levels  = alpha_stage_levels
+)
+
+write_step1_csv(alpha_validation$object_summary, "alpha_object_summary.csv")
+write_step1_csv(alpha_validation$stage_counts, "alpha_stage_cell_counts.csv")
+
+if (length(alpha_validation$warnings) > 0) {
+  write_step1_lines(alpha_validation$warnings, "alpha_state_warnings.txt")
+} else {
+  write_step1_lines("No Step 1 alpha object warnings detected.", "alpha_state_warnings.txt")
+}
+
+project_state <- list(
+  created_at            = Sys.time(),
+  project_root          = project_root,
+  output_dirs           = output_dirs,
+  input_status          = input_status,
+  package_status        = package_status,
+  alpha_stage_levels    = alpha_stage_levels,
+  marker_score_weights  = marker_score_weights,
+  alpha_object_summary  = alpha_validation$object_summary,
+  alpha_stage_counts    = alpha_validation$stage_counts,
+  alpha_state_warnings  = alpha_validation$warnings,
+  session_info          = utils::sessionInfo()
+)
+
+saveRDS(
+  project_state,
+  file = file.path(output_dirs$state, "project_state_step1.rds")
+)
+
+write_step1_lines(
+  c(
+    "Step 1 completed: project state rebuilt.",
+    paste("Project root:", project_root),
+    paste("Output root:", output_root),
+    paste("Alpha object:", alpha_input_path),
+    paste("Cells:", ncol(human_combined_alpha)),
+    paste("Genes:", nrow(human_combined_alpha)),
+    paste(
+      "Stages:",
+      paste(alpha_validation$stage_counts$alpha_stage, alpha_validation$stage_counts$n_cells, sep = "=", collapse = "; ")
+    )
+  ),
+  "step1_status.txt"
+)
+```
+
+```{r step1-display-summary}
+package_status
+input_status
+alpha_validation$object_summary
+alpha_validation$stage_counts
+marker_score_weights
+```
+
+---
+
+# Step 2 - Prepare Analysis-Ready Alpha Inputs
+
+Step 2 converts the loaded integrated alpha object into a clean analysis input
+for marker scoring. The key outputs are a saved Seurat object with explicit
+`alpha_stage` metadata and a per-gene, per-stage expression summary table. These
+tables are not the final marker scores yet; they are the evidence base that Step
+3 will combine with differential expression and regulatory support.
+
+```{r step2-config}
+analysis_assay <- if ("RNA" %in% SeuratObject::Assays(human_combined_alpha)) {
+  "RNA"
+} else {
+  SeuratObject::DefaultAssay(human_combined_alpha)
+}
+
+analysis_layer <- "data"
+
+step2_outputs <- list(
+  alpha_object = file.path(output_dirs$inputs, "human_combined_alpha_analysis_ready.rds"),
+  cell_metadata = file.path(output_dirs$inputs, "alpha_cell_metadata_step2.csv"),
+  stage_counts = file.path(output_dirs$inputs, "alpha_stage_dataset_counts_step2.csv"),
+  qc_summary = file.path(output_dirs$inputs, "alpha_stage_qc_summary_step2.csv"),
+  gene_stage_expression = file.path(output_dirs$marker_scores, "gene_stage_expression_summary_step2.csv"),
+  gene_expression_wide = file.path(output_dirs$marker_scores, "gene_expression_summary_wide_step2.csv"),
+  status = file.path(output_dirs$state, "step2_status.txt"),
+  state = file.path(output_dirs$state, "project_state_step2.rds")
+)
+```
+
+```{r step2-helpers}
+write_step2_csv <- function(data, path) {
+  readr::write_csv(data, path)
+}
+
+write_step2_lines <- function(lines, path = step2_outputs$status) {
+  writeLines(lines, con = path)
+}
+
+prepare_alpha_analysis_object <- function(seurat_obj, expected_levels) {
+  observed_stages <- as.character(SeuratObject::Idents(seurat_obj))
+  missing_stages  <- setdiff(expected_levels, observed_stages)
+
+  if (length(missing_stages) > 0) {
+    stop(
+      "Cannot prepare Step 2 inputs because expected stage label(s) are missing: ",
+      paste(missing_stages, collapse = ", ")
+    )
+  }
+
+  # Stage identity is made explicit in metadata before downstream scoring. This
+  # prevents later chunks from depending on whatever identity class happened to
+  # be active after plotting, subsetting, or DE operations.
+  seurat_obj$alpha_stage <- factor(observed_stages, levels = expected_levels)
+  SeuratObject::Idents(seurat_obj) <- seurat_obj$alpha_stage
+
+  seurat_obj
+}
+
+get_expression_layer <- function(seurat_obj, assay, layer) {
+  if (!assay %in% SeuratObject::Assays(seurat_obj)) {
+    stop(
+      "Assay '", assay, "' was not found. Available assays: ",
+      paste(SeuratObject::Assays(seurat_obj), collapse = ", ")
+    )
+  }
+
+  expr <- SeuratObject::GetAssayData(
+    object = seurat_obj,
+    assay  = assay,
+    layer  = layer
+  )
+
+  if (nrow(expr) == 0 || ncol(expr) == 0) {
+    stop("Expression layer is empty: assay = ", assay, ", layer = ", layer)
+  }
+
+  expr
+}
+
+summarize_alpha_cell_metadata <- function(seurat_obj, expected_levels) {
+  metadata <- seurat_obj@meta.data |>
+    tibble::rownames_to_column("cell_barcode") |>
+    dplyr::mutate(
+      alpha_stage = factor(as.character(alpha_stage), levels = expected_levels)
+    )
+
+  dataset_col <- if ("orig.ident" %in% colnames(metadata)) "orig.ident" else NULL
+
+  stage_counts <- if (!is.null(dataset_col)) {
+    metadata |>
+      dplyr::mutate(dataset = as.character(.data[[dataset_col]])) |>
+      dplyr::count(alpha_stage, dataset, name = "n_cells") |>
+      dplyr::arrange(alpha_stage, dataset)
+  } else {
+    metadata |>
+      dplyr::count(alpha_stage, name = "n_cells") |>
+      dplyr::mutate(dataset = NA_character_) |>
+      dplyr::select(alpha_stage, dataset, n_cells)
+  }
+
+  qc_cols <- metadata |>
+    dplyr::select(where(is.numeric)) |>
+    colnames() |>
+    stringr::str_subset("^(nCount|nFeature|percent)")
+
+  qc_summary <- if (length(qc_cols) > 0) {
+    metadata |>
+      dplyr::select(alpha_stage, dplyr::all_of(qc_cols)) |>
+      tidyr::pivot_longer(
+        cols      = -alpha_stage,
+        names_to  = "metric",
+        values_to = "value"
+      ) |>
+      dplyr::group_by(alpha_stage, metric) |>
+      dplyr::summarise(
+        n_cells = sum(!is.na(value)),
+        median  = stats::median(value, na.rm = TRUE),
+        mean    = mean(value, na.rm = TRUE),
+        q1      = stats::quantile(value, 0.25, na.rm = TRUE),
+        q3      = stats::quantile(value, 0.75, na.rm = TRUE),
+        .groups = "drop"
+      )
+  } else {
+    tibble::tibble(
+      alpha_stage = factor(character(), levels = expected_levels),
+      metric = character(),
+      n_cells = integer(),
+      median = numeric(),
+      mean = numeric(),
+      q1 = numeric(),
+      q3 = numeric()
+    )
+  }
+
+  list(
+    metadata     = metadata,
+    stage_counts = stage_counts,
+    qc_summary   = qc_summary
+  )
+}
+
+summarize_gene_expression_by_stage <- function(seurat_obj,
+                                               expected_levels,
+                                               assay,
+                                               layer) {
+  expr <- get_expression_layer(seurat_obj, assay = assay, layer = layer)
+  metadata <- seurat_obj@meta.data
+
+  # The loop keeps each stage calculation isolated so sparse matrices remain
+  # sparse. For each stage, Step 2 records detectability and expression
+  # magnitude; Step 3 will transform these into weighted marker evidence.
+  stage_tables <- lapply(expected_levels, function(stage_name) {
+    stage_cells <- rownames(metadata)[metadata$alpha_stage == stage_name]
+    stage_cells <- intersect(stage_cells, colnames(expr))
+
+    if (length(stage_cells) == 0) {
+      stop("No cells found in expression matrix for stage: ", stage_name)
+    }
+
+    stage_expr <- expr[, stage_cells, drop = FALSE]
+    detected   <- stage_expr > 0
+    n_detected <- Matrix::rowSums(detected)
+    n_cells    <- ncol(stage_expr)
+
+    tibble::tibble(
+      gene = rownames(stage_expr),
+      alpha_stage = factor(stage_name, levels = expected_levels),
+      n_cells = n_cells,
+      n_detected = as.numeric(n_detected),
+      pct_expressing = as.numeric(n_detected) / n_cells,
+      mean_expression = as.numeric(Matrix::rowMeans(stage_expr)),
+      mean_expression_detected = dplyr::if_else(
+        n_detected > 0,
+        as.numeric(Matrix::rowSums(stage_expr)) / as.numeric(n_detected),
+        0
+      )
+    )
+  })
+
+  dplyr::bind_rows(stage_tables) |>
+    dplyr::arrange(gene, alpha_stage)
+}
+
+make_gene_expression_wide <- function(gene_stage_expression) {
+  gene_stage_expression |>
+    dplyr::mutate(alpha_stage = stringr::str_replace_all(as.character(alpha_stage), " ", "_")) |>
+    tidyr::pivot_wider(
+      id_cols = gene,
+      names_from = alpha_stage,
+      values_from = c(
+        n_cells,
+        n_detected,
+        pct_expressing,
+        mean_expression,
+        mean_expression_detected
+      ),
+      names_glue = "{.value}_{alpha_stage}"
+    ) |>
+    dplyr::mutate(
+      max_pct_expressing = pmax(
+        pct_expressing_Fetal_alpha,
+        pct_expressing_Child_alpha,
+        pct_expressing_Adult_alpha,
+        na.rm = TRUE
+      ),
+      max_mean_expression = pmax(
+        mean_expression_Fetal_alpha,
+        mean_expression_Child_alpha,
+        mean_expression_Adult_alpha,
+        na.rm = TRUE
+      )
+    ) |>
+    dplyr::arrange(dplyr::desc(max_pct_expressing), dplyr::desc(max_mean_expression), gene)
+}
+```
+
+```{r step2-prepare-inputs}
+human_combined_alpha_ready <- prepare_alpha_analysis_object(
+  seurat_obj       = human_combined_alpha,
+  expected_levels  = alpha_stage_levels
+)
+
+SeuratObject::DefaultAssay(human_combined_alpha_ready) <- analysis_assay
+
+cell_summaries <- summarize_alpha_cell_metadata(
+  seurat_obj      = human_combined_alpha_ready,
+  expected_levels = alpha_stage_levels
+)
+
+gene_stage_expression <- summarize_gene_expression_by_stage(
+  seurat_obj      = human_combined_alpha_ready,
+  expected_levels = alpha_stage_levels,
+  assay           = analysis_assay,
+  layer           = analysis_layer
+)
+
+gene_expression_wide <- make_gene_expression_wide(gene_stage_expression)
+
+saveRDS(human_combined_alpha_ready, step2_outputs$alpha_object)
+write_step2_csv(cell_summaries$metadata, step2_outputs$cell_metadata)
+write_step2_csv(cell_summaries$stage_counts, step2_outputs$stage_counts)
+write_step2_csv(cell_summaries$qc_summary, step2_outputs$qc_summary)
+write_step2_csv(gene_stage_expression, step2_outputs$gene_stage_expression)
+write_step2_csv(gene_expression_wide, step2_outputs$gene_expression_wide)
+
+project_state_step2 <- list(
+  created_at             = Sys.time(),
+  project_root           = project_root,
+  analysis_assay         = analysis_assay,
+  analysis_layer         = analysis_layer,
+  alpha_stage_levels     = alpha_stage_levels,
+  step2_outputs          = step2_outputs,
+  cell_stage_counts      = cell_summaries$stage_counts,
+  qc_summary             = cell_summaries$qc_summary,
+  gene_expression_fields = colnames(gene_stage_expression),
+  marker_score_weights   = marker_score_weights,
+  session_info           = utils::sessionInfo()
+)
+
+saveRDS(project_state_step2, step2_outputs$state)
+
+write_step2_lines(
+  c(
+    "Step 2 completed: analysis-ready alpha inputs prepared.",
+    paste("Analysis assay:", analysis_assay),
+    paste("Analysis layer:", analysis_layer),
+    paste("Analysis-ready object:", step2_outputs$alpha_object),
+    paste("Gene-stage expression table:", step2_outputs$gene_stage_expression),
+    paste("Genes summarized:", dplyr::n_distinct(gene_stage_expression$gene)),
+    paste("Gene-stage rows:", nrow(gene_stage_expression))
+  )
+)
+```
+
+```{r step2-display-summary}
+cell_summaries$stage_counts
+cell_summaries$qc_summary
+dplyr::glimpse(gene_stage_expression)
+dplyr::slice_head(gene_expression_wide, n = 20)
+```
+
+---
+
+# Step 3 - Marker Scoring Framework
+
+Step 3 builds the first structured marker scoring framework. Each candidate is
+scored as a gene-stage pair so fetal, child, and adult alpha marker candidates
+remain explicitly separated. The current implementation computes expression
+robustness, stage specificity, effect size, and detectability directly from the
+Step 2 expression summaries.
+
+Regulatory support is included as a high-weight component but is not fabricated.
+If a curated or computed regulatory score table is available, Step 3 will import
+it. Otherwise, the workflow writes a regulatory support template and reports
+regulatory evidence as pending while ranking candidates by the available evidence
+components.
+
+```{r step3-config}
+step3_regulatory_input_path <- file.path(
+  output_dirs$regulatory,
+  "regulatory_support_scores_step3.csv"
+)
+
+step3_outputs <- list(
+  component_weights = file.path(output_dirs$marker_scores, "marker_score_component_weights_step3.csv"),
+  regulatory_template = file.path(output_dirs$regulatory, "regulatory_support_template_step3.csv"),
+  gene_stage_scores = file.path(output_dirs$marker_scores, "gene_stage_marker_scores_step3.csv"),
+  top_candidates = file.path(output_dirs$marker_scores, "top_marker_candidates_by_stage_step3.csv"),
+  status = file.path(output_dirs$state, "step3_status.txt"),
+  state = file.path(output_dirs$state, "project_state_step3.rds")
+)
+
+top_n_markers_per_stage <- 100
+effect_size_pseudocount <- 0.05
+minimum_candidate_pct_expressing <- 0.10
+```
+
+```{r step3-helpers}
+write_step3_csv <- function(data, path) {
+  readr::write_csv(data, path)
+}
+
+write_step3_lines <- function(lines, path = step3_outputs$status) {
+  writeLines(lines, con = path)
+}
+
+rescale_0_1 <- function(x) {
+  if (all(is.na(x))) {
+    return(rep(NA_real_, length(x)))
+  }
+
+  x_min <- min(x, na.rm = TRUE)
+  x_max <- max(x, na.rm = TRUE)
+
+  if (isTRUE(all.equal(x_min, x_max))) {
+    return(ifelse(is.na(x), NA_real_, 0))
+  }
+
+  (x - x_min) / (x_max - x_min)
+}
+
+positive_contrast <- function(target, background, epsilon = 1e-8) {
+  pmax(target - background, 0) / pmax(target, epsilon)
+}
+
+make_regulatory_support_template <- function(genes) {
+  tibble::tibble(
+    gene = sort(unique(genes)),
+    regulatory_support_score = NA_real_,
+    regulatory_evidence_type = NA_character_,
+    regulatory_evidence_source = NA_character_,
+    supporting_tf = NA_character_,
+    supporting_module = NA_character_,
+    notes = NA_character_
+  )
+}
+
+load_regulatory_support <- function(path, genes) {
+  if (!file.exists(path)) {
+    return(list(
+      regulatory_scores = tibble::tibble(
+        gene = sort(unique(genes)),
+        regulatory_support_score = NA_real_,
+        regulatory_support_status = "pending"
+      ),
+      status = "pending"
+    ))
+  }
+
+  regulatory_scores <- readr::read_csv(path, show_col_types = FALSE)
+  required_cols <- c("gene", "regulatory_support_score")
+  missing_cols <- setdiff(required_cols, colnames(regulatory_scores))
+
+  if (length(missing_cols) > 0) {
+    stop(
+      "Regulatory support file is missing required column(s): ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+
+  regulatory_scores <- regulatory_scores |>
+    dplyr::mutate(
+      regulatory_support_score = pmin(pmax(regulatory_support_score, 0), 1),
+      regulatory_support_status = dplyr::if_else(
+        is.na(regulatory_support_score),
+        "pending",
+        "available"
+      )
+    ) |>
+    dplyr::group_by(gene) |>
+    dplyr::summarise(
+      regulatory_support_score = if (all(is.na(regulatory_support_score))) {
+        NA_real_
+      } else {
+        max(regulatory_support_score, na.rm = TRUE)
+      },
+      regulatory_support_status = dplyr::if_else(
+        is.na(regulatory_support_score),
+        "pending",
+        "available"
+      ),
+      .groups = "drop"
+    )
+
+  list(
+    regulatory_scores = regulatory_scores,
+    status = "available"
+  )
+}
+
+build_marker_candidate_table <- function(gene_stage_expression,
+                                         stage_levels,
+                                         pseudocount = 0.05) {
+  expression_wide <- gene_stage_expression |>
+    dplyr::mutate(stage_key = stringr::str_replace_all(as.character(alpha_stage), " ", "_")) |>
+    tidyr::pivot_wider(
+      id_cols = gene,
+      names_from = stage_key,
+      values_from = c(pct_expressing, mean_expression, mean_expression_detected),
+      names_glue = "{.value}_{stage_key}"
+    )
+
+  # The scoring table is intentionally expanded back to gene-stage rows. This
+  # keeps target-stage evidence, background-stage evidence, and score components
+  # visible for review before any ranking decisions are made.
+  candidate_tables <- lapply(stage_levels, function(stage_name) {
+    stage_key <- stringr::str_replace_all(stage_name, " ", "_")
+    other_keys <- stringr::str_replace_all(setdiff(stage_levels, stage_name), " ", "_")
+
+    target_pct_col <- paste0("pct_expressing_", stage_key)
+    target_mean_col <- paste0("mean_expression_", stage_key)
+    target_detected_mean_col <- paste0("mean_expression_detected_", stage_key)
+
+    other_pct_cols <- paste0("pct_expressing_", other_keys)
+    other_mean_cols <- paste0("mean_expression_", other_keys)
+
+    other_pct_matrix <- as.matrix(expression_wide[, other_pct_cols, drop = FALSE])
+    other_mean_matrix <- as.matrix(expression_wide[, other_mean_cols, drop = FALSE])
+
+    tibble::tibble(
+      gene = expression_wide$gene,
+      target_stage = factor(stage_name, levels = stage_levels),
+      target_pct_expressing = expression_wide[[target_pct_col]],
+      target_mean_expression = expression_wide[[target_mean_col]],
+      target_mean_expression_detected = expression_wide[[target_detected_mean_col]],
+      max_other_pct_expressing = apply(other_pct_matrix, 1, max, na.rm = TRUE),
+      max_other_mean_expression = apply(other_mean_matrix, 1, max, na.rm = TRUE),
+      mean_other_pct_expressing = rowMeans(other_pct_matrix, na.rm = TRUE),
+      mean_other_mean_expression = rowMeans(other_mean_matrix, na.rm = TRUE)
+    )
+  })
+
+  dplyr::bind_rows(candidate_tables) |>
+    dplyr::mutate(
+      log2_mean_expression_fc = log2(
+        (target_mean_expression + pseudocount) /
+          (mean_other_mean_expression + pseudocount)
+      ),
+      pct_expression_contrast = positive_contrast(
+        target = target_pct_expressing,
+        background = max_other_pct_expressing
+      ),
+      mean_expression_contrast = positive_contrast(
+        target = target_mean_expression,
+        background = max_other_mean_expression
+      )
+    )
+}
+
+score_marker_candidates <- function(candidate_table,
+                                    regulatory_scores,
+                                    weights,
+                                    minimum_pct_expressing = 0.10) {
+  scored <- candidate_table |>
+    dplyr::group_by(target_stage) |>
+    dplyr::mutate(
+      target_mean_expression_scaled = rescale_0_1(target_mean_expression),
+      target_detected_mean_scaled = rescale_0_1(target_mean_expression_detected),
+      positive_log2_fc = pmax(log2_mean_expression_fc, 0),
+      effect_size_score = rescale_0_1(positive_log2_fc),
+      # Expression robustness favors genes detected across many cells, then uses
+      # scaled expression among detected cells as supporting evidence. This avoids
+      # selecting rare high-expression genes as robust markers.
+      expression_robustness_score = (0.70 * target_pct_expressing) +
+        (0.30 * target_detected_mean_scaled),
+      stage_specificity_score = (0.50 * pct_expression_contrast) +
+        (0.50 * mean_expression_contrast),
+      detectability_score = target_pct_expressing
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::left_join(regulatory_scores, by = "gene")
+
+  score_cols <- paste0(weights$score_component, "_score")
+  available_score_cols <- intersect(score_cols, colnames(scored))
+  missing_score_cols <- setdiff(score_cols, available_score_cols)
+
+  if (length(missing_score_cols) > 0) {
+    stop(
+      "Cannot calculate marker scores. Missing component score column(s): ",
+      paste(missing_score_cols, collapse = ", ")
+    )
+  }
+
+  score_matrix <- as.matrix(scored[, score_cols])
+  weight_vector <- weights$weight[match(
+    stringr::str_remove(score_cols, "_score$"),
+    weights$score_component
+  )]
+  weight_matrix <- matrix(
+    weight_vector,
+    nrow = nrow(score_matrix),
+    ncol = length(weight_vector),
+    byrow = TRUE
+  )
+
+  # Weighted scores are calculated two ways. The strict score keeps regulatory
+  # support as missing until real evidence exists; the available-evidence score
+  # rescales only across observed components so Step 3 can still prioritize
+  # expression-supported candidates without pretending regulatory data exist.
+  weighted_numerator <- rowSums(score_matrix * weight_matrix, na.rm = TRUE)
+  available_weight <- rowSums((!is.na(score_matrix)) * weight_matrix)
+  strict_weighted_score <- weighted_numerator
+  available_weighted_score <- weighted_numerator / available_weight
+
+  scored |>
+    dplyr::mutate(
+      strict_weighted_score = strict_weighted_score,
+      available_weighted_score = available_weighted_score,
+      available_component_weight = available_weight,
+      regulatory_support_status = dplyr::coalesce(regulatory_support_status, "pending"),
+      passes_minimum_detectability = target_pct_expressing >= minimum_pct_expressing,
+      marker_priority = dplyr::case_when(
+        !passes_minimum_detectability ~ "low_detectability",
+        available_weighted_score >= 0.80 ~ "high",
+        available_weighted_score >= 0.60 ~ "moderate",
+        TRUE ~ "exploratory"
+      )
+    ) |>
+    dplyr::arrange(target_stage, dplyr::desc(available_weighted_score), gene)
+}
+```
+
+```{r step3-build-marker-scores}
+regulatory_template <- make_regulatory_support_template(gene_stage_expression$gene)
+write_step3_csv(regulatory_template, step3_outputs$regulatory_template)
+
+regulatory_support <- load_regulatory_support(
+  path  = step3_regulatory_input_path,
+  genes = gene_stage_expression$gene
+)
+
+marker_candidate_table <- build_marker_candidate_table(
+  gene_stage_expression = gene_stage_expression,
+  stage_levels          = alpha_stage_levels,
+  pseudocount           = effect_size_pseudocount
+)
+
+gene_stage_marker_scores <- score_marker_candidates(
+  candidate_table         = marker_candidate_table,
+  regulatory_scores       = regulatory_support$regulatory_scores,
+  weights                 = marker_score_weights,
+  minimum_pct_expressing  = minimum_candidate_pct_expressing
+)
+
+top_marker_candidates <- gene_stage_marker_scores |>
+  dplyr::filter(passes_minimum_detectability) |>
+  dplyr::group_by(target_stage) |>
+  dplyr::slice_max(
+    order_by = available_weighted_score,
+    n = top_n_markers_per_stage,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(target_stage, dplyr::desc(available_weighted_score), gene)
+
+write_step3_csv(marker_score_weights, step3_outputs$component_weights)
+write_step3_csv(gene_stage_marker_scores, step3_outputs$gene_stage_scores)
+write_step3_csv(top_marker_candidates, step3_outputs$top_candidates)
+
+project_state_step3 <- list(
+  created_at = Sys.time(),
+  project_root = project_root,
+  alpha_stage_levels = alpha_stage_levels,
+  marker_score_weights = marker_score_weights,
+  regulatory_support_status = regulatory_support$status,
+  regulatory_support_input = step3_regulatory_input_path,
+  minimum_candidate_pct_expressing = minimum_candidate_pct_expressing,
+  top_n_markers_per_stage = top_n_markers_per_stage,
+  step3_outputs = step3_outputs,
+  score_columns = colnames(gene_stage_marker_scores),
+  session_info = utils::sessionInfo()
+)
+
+saveRDS(project_state_step3, step3_outputs$state)
+
+write_step3_lines(
+  c(
+    "Step 3 completed: marker scoring framework built.",
+    paste("Regulatory support status:", regulatory_support$status),
+    paste("Gene-stage marker score table:", step3_outputs$gene_stage_scores),
+    paste("Top marker candidate table:", step3_outputs$top_candidates),
+    paste("Regulatory support template:", step3_outputs$regulatory_template),
+    paste("Candidate rows scored:", nrow(gene_stage_marker_scores)),
+    paste("Top candidates saved per stage:", top_n_markers_per_stage)
+  )
+)
+```
+
+```{r step3-display-summary}
+marker_score_weights
+gene_stage_marker_scores |>
+  dplyr::count(target_stage, marker_priority, regulatory_support_status)
+
+top_marker_candidates |>
+  dplyr::group_by(target_stage) |>
+  dplyr::slice_head(n = 20) |>
+  dplyr::ungroup()
+```
+
+---
+
+# Step 4 - Regulatory Support Evidence
+
+Step 4 adds the regulatory support layer that Step 3 reserved but did not
+fabricate. The workflow searches for motif enrichment and co-expression module
+outputs from the existing alpha maturation analysis, converts them into a
+gene-level regulatory support score, and then re-runs the marker scoring
+framework with the regulatory component filled where evidence exists.
+
+Motif enrichment evidence is treated as stronger support than simple module
+membership because motifs provide a more direct TF-target hypothesis. Module
+membership is retained as lower-confidence support because it still captures
+coordinated gene behavior that may reflect shared regulation.
+
+```{r step4-config}
+step4_evidence_dirs <- unique(c(
+  output_dirs$regulatory,
+  output_dirs$marker_scores,
+  resolve_project_file("output"),
+  file.path(project_root, "output")
+))
+
+step4_outputs <- list(
+  input_manifest = file.path(output_dirs$regulatory, "regulatory_input_manifest_step4.csv"),
+  evidence_long = file.path(output_dirs$regulatory, "regulatory_evidence_long_step4.csv"),
+  support_scores = file.path(output_dirs$regulatory, "regulatory_support_scores_step4.csv"),
+  step3_compatible_scores = step3_regulatory_input_path,
+  gene_stage_scores = file.path(output_dirs$marker_scores, "gene_stage_marker_scores_regulatory_step4.csv"),
+  top_candidates = file.path(output_dirs$marker_scores, "top_marker_candidates_regulatory_step4.csv"),
+  status = file.path(output_dirs$state, "step4_status.txt"),
+  state = file.path(output_dirs$state, "project_state_step4.rds")
+)
+
+motif_evidence_weight <- 1.00
+module_evidence_cap <- 0.25
+module_bonus_when_motif_supported <- 0.15
+```
+
+```{r step4-helpers}
+write_step4_csv <- function(data, path) {
+  readr::write_csv(data, path)
+}
+
+write_step4_lines <- function(lines, path = step4_outputs$status) {
+  writeLines(lines, con = path)
+}
+
+empty_regulatory_evidence <- function() {
+  tibble::tibble(
+    gene = character(),
+    evidence_type = character(),
+    evidence_source = character(),
+    evidence_score = numeric(),
+    supporting_tf = character(),
+    supporting_module = character(),
+    notes = character()
+  )
+}
+
+discover_regulatory_inputs <- function(search_dirs) {
+  existing_dirs <- search_dirs[dir.exists(search_dirs)]
+
+  if (length(existing_dirs) == 0) {
+    return(tibble::tibble(
+      evidence_class = character(),
+      source_dir = character(),
+      source_file = character(),
+      path = character()
+    ))
+  }
+
+  discovered <- lapply(existing_dirs, function(search_dir) {
+    paths <- list.files(
+      search_dir,
+      pattern = "(MotifEnrichment|Modules_).*\\.csv$",
+      full.names = TRUE,
+      recursive = TRUE
+    )
+
+    if (length(paths) == 0) {
+      return(NULL)
+    }
+
+    tibble::tibble(
+      path = normalizePath(paths, winslash = "/", mustWork = TRUE),
+      source_dir = normalizePath(search_dir, winslash = "/", mustWork = TRUE),
+      source_file = basename(paths),
+      evidence_class = dplyr::case_when(
+        stringr::str_detect(source_file, "MotifEnrichment") ~ "motif_enrichment",
+        stringr::str_detect(source_file, "^Modules_") ~ "coexpression_module",
+        TRUE ~ "unknown"
+      )
+    )
+  })
+
+  dplyr::bind_rows(discovered) |>
+    dplyr::filter(evidence_class != "unknown") |>
+    dplyr::distinct(path, .keep_all = TRUE) |>
+    dplyr::select(evidence_class, source_dir, source_file, path) |>
+    dplyr::arrange(evidence_class, source_file)
+}
+
+parse_enriched_gene_string <- function(x) {
+  if (is.na(x) || !nzchar(x)) {
+    return(character())
+  }
+
+  x |>
+    stringr::str_split("[;/,]") |>
+    unlist(use.names = FALSE) |>
+    stringr::str_trim() |>
+    unique() |>
+    setdiff("")
+}
+
+parse_motif_evidence_file <- function(path) {
+  motif_df <- readr::read_csv(path, show_col_types = FALSE)
+  required_cols <- c("NES", "enrichedGenes")
+  missing_cols <- setdiff(required_cols, colnames(motif_df))
+
+  if (length(missing_cols) > 0) {
+    warning(
+      "Skipping motif file with missing column(s): ",
+      basename(path), " -> ", paste(missing_cols, collapse = ", ")
+    )
+    return(empty_regulatory_evidence())
+  }
+
+  tf_col <- intersect(c("TF_highConf", "TF", "tf", "transcription_factor"), colnames(motif_df))
+  motif_df$supporting_tf <- if (length(tf_col) > 0) {
+    as.character(motif_df[[tf_col[[1]]]])
+  } else {
+    NA_character_
+  }
+
+  motif_df <- motif_df |>
+    dplyr::filter(!is.na(NES), !is.na(enrichedGenes), enrichedGenes != "")
+
+  if (nrow(motif_df) == 0) {
+    return(empty_regulatory_evidence())
+  }
+
+  # NES is normalized within each motif file before gene expansion. This keeps
+  # evidence comparable across separate module/comparison runs while preserving
+  # the strongest motifs in each run.
+  motif_df <- motif_df |>
+    dplyr::mutate(
+      motif_score = 0.50 + (0.50 * rescale_0_1(NES))
+    )
+
+  motif_evidence <- lapply(seq_len(nrow(motif_df)), function(row_idx) {
+    genes <- parse_enriched_gene_string(motif_df$enrichedGenes[[row_idx]])
+
+    if (length(genes) == 0) {
+      return(empty_regulatory_evidence())
+    }
+
+    tibble::tibble(
+      gene = genes,
+      evidence_type = "motif_target",
+      evidence_source = basename(path),
+      evidence_score = motif_df$motif_score[[row_idx]] * motif_evidence_weight,
+      supporting_tf = motif_df$supporting_tf[[row_idx]],
+      supporting_module = NA_character_,
+      notes = paste0("RcisTarget motif support; NES=", round(motif_df$NES[[row_idx]], 3))
+    )
+  })
+
+  dplyr::bind_rows(motif_evidence)
+}
+
+parse_module_evidence_file <- function(path) {
+  module_df <- readr::read_csv(path, show_col_types = FALSE)
+  gene_col <- intersect(c("Gene", "gene"), colnames(module_df))
+  module_col <- intersect(c("Module", "module"), colnames(module_df))
+
+  if (length(gene_col) == 0 || length(module_col) == 0) {
+    warning("Skipping module file without Gene/Module columns: ", basename(path))
+    return(empty_regulatory_evidence())
+  }
+
+  module_df <- module_df |>
+    dplyr::transmute(
+      gene = as.character(.data[[gene_col[[1]]]]),
+      supporting_module = as.character(.data[[module_col[[1]]]])
+    ) |>
+    dplyr::filter(!is.na(gene), gene != "", !is.na(supporting_module), supporting_module != "") |>
+    dplyr::distinct()
+
+  if (nrow(module_df) == 0) {
+    return(empty_regulatory_evidence())
+  }
+
+  module_sizes <- module_df |>
+    dplyr::count(supporting_module, name = "module_size")
+
+  module_df |>
+    dplyr::left_join(module_sizes, by = "supporting_module") |>
+    dplyr::mutate(
+      evidence_type = "coexpression_module_membership",
+      evidence_source = basename(path),
+      evidence_score = module_evidence_cap,
+      supporting_tf = NA_character_,
+      notes = paste0("Co-expression module membership; module_size=", module_size)
+    ) |>
+    dplyr::select(
+      gene,
+      evidence_type,
+      evidence_source,
+      evidence_score,
+      supporting_tf,
+      supporting_module,
+      notes
+    )
+}
+
+build_regulatory_evidence <- function(input_manifest) {
+  if (nrow(input_manifest) == 0) {
+    return(empty_regulatory_evidence())
+  }
+
+  evidence_tables <- lapply(seq_len(nrow(input_manifest)), function(row_idx) {
+    evidence_class <- input_manifest$evidence_class[[row_idx]]
+    path <- input_manifest$path[[row_idx]]
+
+    if (evidence_class == "motif_enrichment") {
+      return(parse_motif_evidence_file(path))
+    }
+
+    if (evidence_class == "coexpression_module") {
+      return(parse_module_evidence_file(path))
+    }
+
+    empty_regulatory_evidence()
+  })
+
+  dplyr::bind_rows(evidence_tables) |>
+    dplyr::filter(gene %in% gene_stage_expression$gene) |>
+    dplyr::distinct()
+}
+
+summarize_regulatory_support <- function(regulatory_evidence, genes) {
+  if (nrow(regulatory_evidence) == 0) {
+    return(tibble::tibble(
+      gene = sort(unique(genes)),
+      regulatory_support_score = NA_real_,
+      regulatory_support_status = "pending",
+      motif_support_score = NA_real_,
+      module_support_score = NA_real_,
+      n_regulatory_evidence_records = 0L,
+      supporting_tf = NA_character_,
+      supporting_module = NA_character_
+    ))
+  }
+
+  motif_summary <- regulatory_evidence |>
+    dplyr::filter(evidence_type == "motif_target") |>
+    dplyr::group_by(gene) |>
+    dplyr::summarise(
+      motif_support_score = max(evidence_score, na.rm = TRUE),
+      supporting_tf = paste(sort(unique(stats::na.omit(supporting_tf))), collapse = ";"),
+      .groups = "drop"
+    )
+
+  module_summary <- regulatory_evidence |>
+    dplyr::filter(evidence_type == "coexpression_module_membership") |>
+    dplyr::group_by(gene) |>
+    dplyr::summarise(
+      module_support_score = max(evidence_score, na.rm = TRUE),
+      supporting_module = paste(sort(unique(stats::na.omit(supporting_module))), collapse = ";"),
+      .groups = "drop"
+    )
+
+  evidence_counts <- regulatory_evidence |>
+    dplyr::count(gene, name = "n_regulatory_evidence_records")
+
+  # Aggregation is intentionally conservative: motif support can carry the full
+  # regulatory score, while module membership alone is capped. When both are
+  # present, module evidence provides a small bonus because independent evidence
+  # streams support the same gene.
+  tibble::tibble(gene = sort(unique(genes))) |>
+    dplyr::left_join(motif_summary, by = "gene") |>
+    dplyr::left_join(module_summary, by = "gene") |>
+    dplyr::left_join(evidence_counts, by = "gene") |>
+    dplyr::mutate(
+      motif_support_score = dplyr::if_else(is.na(motif_support_score), 0, motif_support_score),
+      module_support_score = dplyr::if_else(is.na(module_support_score), 0, module_support_score),
+      n_regulatory_evidence_records = dplyr::if_else(
+        is.na(n_regulatory_evidence_records),
+        0L,
+        n_regulatory_evidence_records
+      ),
+      regulatory_support_score = dplyr::case_when(
+        motif_support_score > 0 & module_support_score > 0 ~ pmin(
+          1,
+          motif_support_score + module_bonus_when_motif_supported
+        ),
+        motif_support_score > 0 ~ motif_support_score,
+        module_support_score > 0 ~ module_support_score,
+        TRUE ~ NA_real_
+      ),
+      regulatory_support_status = dplyr::if_else(
+        is.na(regulatory_support_score),
+        "pending",
+        "available"
+      ),
+      supporting_tf = dplyr::na_if(supporting_tf, ""),
+      supporting_module = dplyr::na_if(supporting_module, "")
+    ) |>
+    dplyr::arrange(dplyr::desc(regulatory_support_score), gene)
+}
+```
+
+```{r step4-build-regulatory-support}
+regulatory_input_manifest <- discover_regulatory_inputs(step4_evidence_dirs)
+regulatory_evidence_long <- build_regulatory_evidence(regulatory_input_manifest)
+regulatory_support_scores <- summarize_regulatory_support(
+  regulatory_evidence = regulatory_evidence_long,
+  genes = gene_stage_expression$gene
+)
+
+write_step4_csv(regulatory_input_manifest, step4_outputs$input_manifest)
+write_step4_csv(regulatory_evidence_long, step4_outputs$evidence_long)
+write_step4_csv(regulatory_support_scores, step4_outputs$support_scores)
+
+# Step 3 reads this path when regulatory evidence exists. Writing the same
+# two-column-compatible table here lets the framework be re-run from Step 3
+# without manually copying files.
+write_step4_csv(
+  regulatory_support_scores |>
+    dplyr::select(gene, regulatory_support_score),
+  step4_outputs$step3_compatible_scores
+)
+
+step4_regulatory_scores_for_scoring <- regulatory_support_scores |>
+  dplyr::select(gene, regulatory_support_score, regulatory_support_status)
+
+gene_stage_marker_scores_step4 <- score_marker_candidates(
+  candidate_table = marker_candidate_table,
+  regulatory_scores = step4_regulatory_scores_for_scoring,
+  weights = marker_score_weights,
+  minimum_pct_expressing = minimum_candidate_pct_expressing
+)
+
+top_marker_candidates_step4 <- gene_stage_marker_scores_step4 |>
+  dplyr::filter(passes_minimum_detectability) |>
+  dplyr::group_by(target_stage) |>
+  dplyr::slice_max(
+    order_by = strict_weighted_score,
+    n = top_n_markers_per_stage,
+    with_ties = FALSE
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(target_stage, dplyr::desc(strict_weighted_score), gene)
+
+write_step4_csv(gene_stage_marker_scores_step4, step4_outputs$gene_stage_scores)
+write_step4_csv(top_marker_candidates_step4, step4_outputs$top_candidates)
+
+project_state_step4 <- list(
+  created_at = Sys.time(),
+  project_root = project_root,
+  searched_evidence_dirs = step4_evidence_dirs,
+  regulatory_input_manifest = regulatory_input_manifest,
+  n_regulatory_evidence_records = nrow(regulatory_evidence_long),
+  n_supported_genes = sum(regulatory_support_scores$regulatory_support_status == "available"),
+  step4_outputs = step4_outputs,
+  marker_score_weights = marker_score_weights,
+  session_info = utils::sessionInfo()
+)
+
+saveRDS(project_state_step4, step4_outputs$state)
+
+write_step4_lines(
+  c(
+    "Step 4 completed: regulatory support evidence integrated.",
+    paste("Regulatory input files found:", nrow(regulatory_input_manifest)),
+    paste("Regulatory evidence records:", nrow(regulatory_evidence_long)),
+    paste("Genes with regulatory support:", project_state_step4$n_supported_genes),
+    paste("Regulatory support scores:", step4_outputs$support_scores),
+    paste("Regulatory marker score table:", step4_outputs$gene_stage_scores),
+    paste("Top regulatory marker candidates:", step4_outputs$top_candidates)
+  )
+)
+```
+
+```{r step4-display-summary}
+regulatory_input_manifest
+
+regulatory_support_scores |>
+  dplyr::count(regulatory_support_status)
+
+top_marker_candidates_step4 |>
+  dplyr::group_by(target_stage) |>
+  dplyr::slice_head(n = 20) |>
+  dplyr::ungroup()
+```
+
+---
+
+# Step 5 - Marker Review Package
+
+Step 5 converts the regulatory-aware marker scores into review-ready outputs for
+publication planning. This step does not declare final markers automatically.
+Instead, it assigns evidence tiers, flags common technical/biological caveats,
+and exports compact stage-specific candidate tables that can be reviewed before
+experimental validation or manuscript use.
+
+```{r step5-config}
+step5_outputs <- list(
+  review_table = file.path(output_dirs$tables, "marker_candidate_review_table_step5.csv"),
+  stage_panel = file.path(output_dirs$tables, "marker_candidate_panel_by_stage_step5.csv"),
+  evidence_summary = file.path(output_dirs$tables, "marker_evidence_summary_step5.csv"),
+  score_distribution_plot = file.path(output_dirs$figures, "marker_score_distribution_step5.pdf"),
+  top_candidate_plot = file.path(output_dirs$figures, "top_marker_candidates_step5.pdf"),
+  status = file.path(output_dirs$state, "step5_status.txt"),
+  state = file.path(output_dirs$state, "project_state_step5.rds")
+)
+
+primary_panel_n_per_stage <- 25
+secondary_panel_n_per_stage <- 50
+```
+
+```{r step5-helpers}
+write_step5_csv <- function(data, path) {
+  readr::write_csv(data, path)
+}
+
+write_step5_lines <- function(lines, path = step5_outputs$status) {
+  writeLines(lines, con = path)
+}
+
+flag_marker_caveats <- function(gene) {
+  dplyr::case_when(
+    stringr::str_detect(gene, "^MT-") ~ "mitochondrial_gene",
+    stringr::str_detect(gene, "^RP[SL]") ~ "ribosomal_gene",
+    stringr::str_detect(gene, "^MALAT1$|^NEAT1$") ~ "abundant_non_coding_rna",
+    TRUE ~ "none"
+  )
+}
+
+assign_marker_evidence_tier <- function(scored_table) {
+  scored_table |>
+    dplyr::mutate(
+      technical_caveat = flag_marker_caveats(gene),
+      # Tiering is intentionally strict and ordered. Regulatory support is
+      # required for Tier 1 because the scoring plan gives regulatory evidence a
+      # high weight; strong expression-only candidates are retained as Tier 2 for
+      # follow-up rather than being promoted prematurely.
+      marker_evidence_tier = dplyr::case_when(
+        !passes_minimum_detectability ~ "Tier 4 - low detectability",
+        technical_caveat != "none" ~ "Tier 4 - technical caveat",
+        regulatory_support_status == "available" &
+          strict_weighted_score >= 0.75 &
+          expression_robustness_score >= 0.60 &
+          stage_specificity_score >= 0.40 ~ "Tier 1 - regulatory supported",
+        available_weighted_score >= 0.70 &
+          expression_robustness_score >= 0.55 &
+          stage_specificity_score >= 0.35 ~ "Tier 2 - expression supported",
+        available_weighted_score >= 0.55 &
+          expression_robustness_score >= 0.40 ~ "Tier 3 - exploratory",
+        TRUE ~ "Tier 4 - low priority"
+      ),
+      recommended_use = dplyr::case_when(
+        marker_evidence_tier == "Tier 1 - regulatory supported" ~ "primary_candidate",
+        marker_evidence_tier == "Tier 2 - expression supported" ~ "secondary_candidate",
+        marker_evidence_tier == "Tier 3 - exploratory" ~ "exploratory_candidate",
+        TRUE ~ "not_prioritized"
+      )
+    )
+}
+
+build_marker_review_table <- function(scored_table) {
+  assign_marker_evidence_tier(scored_table) |>
+    dplyr::group_by(target_stage) |>
+    dplyr::arrange(
+      target_stage,
+      dplyr::desc(strict_weighted_score),
+      dplyr::desc(available_weighted_score),
+      dplyr::desc(expression_robustness_score),
+      gene
+    ) |>
+    dplyr::mutate(stage_rank = dplyr::row_number()) |>
+    dplyr::ungroup() |>
+    dplyr::select(
+      target_stage,
+      stage_rank,
+      gene,
+      recommended_use,
+      marker_evidence_tier,
+      strict_weighted_score,
+      available_weighted_score,
+      expression_robustness_score,
+      regulatory_support_score,
+      regulatory_support_status,
+      stage_specificity_score,
+      effect_size_score,
+      detectability_score,
+      target_pct_expressing,
+      max_other_pct_expressing,
+      target_mean_expression,
+      max_other_mean_expression,
+      log2_mean_expression_fc,
+      technical_caveat,
+      marker_priority,
+      dplyr::everything()
+    )
+}
+
+build_stage_marker_panel <- function(review_table,
+                                     primary_n = 25,
+                                     secondary_n = 50) {
+  review_table |>
+    dplyr::filter(recommended_use %in% c("primary_candidate", "secondary_candidate")) |>
+    dplyr::group_by(target_stage, recommended_use) |>
+    dplyr::arrange(
+      target_stage,
+      recommended_use,
+      stage_rank,
+      .by_group = TRUE
+    ) |>
+    dplyr::mutate(use_rank = dplyr::row_number()) |>
+    dplyr::ungroup() |>
+    dplyr::filter(
+      (recommended_use == "primary_candidate" & use_rank <= primary_n) |
+        (recommended_use == "secondary_candidate" & use_rank <= secondary_n)
+    ) |>
+    dplyr::arrange(target_stage, recommended_use, use_rank)
+}
+
+summarize_marker_review <- function(review_table) {
+  review_table |>
+    dplyr::group_by(target_stage, marker_evidence_tier, recommended_use) |>
+    dplyr::summarise(
+      n_genes = dplyr::n(),
+      median_strict_score = stats::median(strict_weighted_score, na.rm = TRUE),
+      median_available_score = stats::median(available_weighted_score, na.rm = TRUE),
+      n_regulatory_supported = sum(regulatory_support_status == "available"),
+      .groups = "drop"
+    ) |>
+    dplyr::arrange(target_stage, recommended_use, marker_evidence_tier)
+}
+
+save_step5_plots <- function(review_table, stage_panel, outputs) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    return("ggplot2 not available; Step 5 plot files were not written.")
+  }
+
+  score_plot <- ggplot2::ggplot(
+    review_table,
+    ggplot2::aes(x = target_stage, y = available_weighted_score, fill = marker_evidence_tier)
+  ) +
+    ggplot2::geom_boxplot(outlier.alpha = 0.25) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = "Alpha Maturation Marker Score Distribution",
+      x = "Target alpha stage",
+      y = "Available-evidence weighted marker score",
+      fill = "Evidence tier"
+    ) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 30, hjust = 1))
+
+  ggplot2::ggsave(
+    filename = outputs$score_distribution_plot,
+    plot = score_plot,
+    width = 8,
+    height = 5
+  )
+
+  top_plot_data <- stage_panel |>
+    dplyr::filter(recommended_use == "primary_candidate") |>
+    dplyr::group_by(target_stage) |>
+    dplyr::slice_head(n = 15) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      gene_label = factor(gene, levels = rev(unique(gene)))
+    )
+
+  if (nrow(top_plot_data) > 0) {
+    top_plot <- ggplot2::ggplot(
+      top_plot_data,
+      ggplot2::aes(x = available_weighted_score, y = gene_label, color = target_stage)
+    ) +
+      ggplot2::geom_point(size = 3) +
+      ggplot2::facet_wrap(~ target_stage, scales = "free_y") +
+      ggplot2::theme_bw() +
+      ggplot2::labs(
+        title = "Top Primary Alpha Maturation Marker Candidates",
+        x = "Available-evidence weighted marker score",
+        y = "Candidate gene",
+        color = "Target stage"
+      )
+
+    ggplot2::ggsave(
+      filename = outputs$top_candidate_plot,
+      plot = top_plot,
+      width = 10,
+      height = 7
+    )
+  }
+
+  "Step 5 plot files written."
+}
+```
+
+```{r step5-build-review-package}
+marker_review_table <- build_marker_review_table(gene_stage_marker_scores_step4)
+
+stage_marker_panel <- build_stage_marker_panel(
+  review_table = marker_review_table,
+  primary_n = primary_panel_n_per_stage,
+  secondary_n = secondary_panel_n_per_stage
+)
+
+marker_evidence_summary <- summarize_marker_review(marker_review_table)
+step5_plot_status <- save_step5_plots(
+  review_table = marker_review_table,
+  stage_panel = stage_marker_panel,
+  outputs = step5_outputs
+)
+
+write_step5_csv(marker_review_table, step5_outputs$review_table)
+write_step5_csv(stage_marker_panel, step5_outputs$stage_panel)
+write_step5_csv(marker_evidence_summary, step5_outputs$evidence_summary)
+
+project_state_step5 <- list(
+  created_at = Sys.time(),
+  project_root = project_root,
+  primary_panel_n_per_stage = primary_panel_n_per_stage,
+  secondary_panel_n_per_stage = secondary_panel_n_per_stage,
+  step5_outputs = step5_outputs,
+  plot_status = step5_plot_status,
+  evidence_summary = marker_evidence_summary,
+  session_info = utils::sessionInfo()
+)
+
+saveRDS(project_state_step5, step5_outputs$state)
+
+write_step5_lines(
+  c(
+    "Step 5 completed: marker review package generated.",
+    paste("Review table:", step5_outputs$review_table),
+    paste("Stage marker panel:", step5_outputs$stage_panel),
+    paste("Evidence summary:", step5_outputs$evidence_summary),
+    paste("Plot status:", step5_plot_status),
+    paste("Review rows:", nrow(marker_review_table)),
+    paste("Panel rows:", nrow(stage_marker_panel))
+  )
+)
+```
+
+```{r step5-display-summary}
+marker_evidence_summary
+
+stage_marker_panel |>
+  dplyr::group_by(target_stage, recommended_use) |>
+  dplyr::slice_head(n = 15) |>
+  dplyr::ungroup()
+```
+
+---
+
+# Step 6 - Candidate Marker Expression Validation
+
+Step 6 creates a focused validation package for the highest-priority marker
+candidates. The goal is to verify that candidate markers show the expected
+stage-enriched expression pattern in the alpha subset before they are advanced
+to biological interpretation or experimental validation.
+
+This step uses the Step 2 analysis-ready Seurat object and the Step 5 review
+tables. It does not recluster, reintegrate, or alter upstream scRNA-seq results.
+
+```{r step6-config}
+step6_outputs <- list(
+  validation_gene_set = file.path(output_dirs$tables, "marker_validation_gene_set_step6.csv"),
+  validation_summary = file.path(output_dirs$tables, "marker_validation_expression_summary_step6.csv"),
+  validation_matrix = file.path(output_dirs$tables, "marker_validation_expression_matrix_step6.csv"),
+  dotplot = file.path(output_dirs$figures, "marker_validation_dotplot_step6.pdf"),
+  violin_plot = file.path(output_dirs$figures, "marker_validation_violin_step6.pdf"),
+  heatmap_plot = file.path(output_dirs$figures, "marker_validation_heatmap_step6.pdf"),
+  status = file.path(output_dirs$state, "step6_status.txt"),
+  state = file.path(output_dirs$state, "project_state_step6.rds")
+)
+
+validation_primary_n_per_stage <- 10
+validation_secondary_n_per_stage <- 5
+```
+
+```{r step6-helpers}
+write_step6_csv <- function(data, path) {
+  readr::write_csv(data, path)
+}
+
+write_step6_lines <- function(lines, path = step6_outputs$status) {
+  writeLines(lines, con = path)
+}
+
+select_validation_markers <- function(stage_panel,
+                                      review_table,
+                                      stage_levels,
+                                      primary_n = 10,
+                                      secondary_n = 5) {
+  primary_candidates <- stage_panel |>
+    dplyr::filter(recommended_use == "primary_candidate") |>
+    dplyr::group_by(target_stage) |>
+    dplyr::arrange(use_rank, .by_group = TRUE) |>
+    dplyr::slice_head(n = primary_n) |>
+    dplyr::ungroup()
+
+  secondary_candidates <- stage_panel |>
+    dplyr::filter(recommended_use == "secondary_candidate") |>
+    dplyr::group_by(target_stage) |>
+    dplyr::arrange(use_rank, .by_group = TRUE) |>
+    dplyr::slice_head(n = secondary_n) |>
+    dplyr::ungroup()
+
+  selected <- dplyr::bind_rows(primary_candidates, secondary_candidates)
+
+  # If regulatory support is not yet available, strict Tier 1 candidates may be
+  # sparse or absent for one or more stages. This fallback fills only missing
+  # stages with the best expression-supported, non-technical candidates while
+  # retaining the original evidence tier in the output table.
+  missing_stage_levels <- setdiff(stage_levels, as.character(unique(selected$target_stage)))
+  if (length(missing_stage_levels) > 0) {
+    fallback_candidates <- review_table |>
+      dplyr::filter(
+        target_stage %in% missing_stage_levels,
+        passes_minimum_detectability,
+        technical_caveat == "none",
+        recommended_use %in% c("secondary_candidate", "exploratory_candidate")
+      ) |>
+      dplyr::group_by(target_stage) |>
+      dplyr::arrange(stage_rank, .by_group = TRUE) |>
+      dplyr::slice_head(n = primary_n + secondary_n) |>
+      dplyr::ungroup() |>
+      dplyr::mutate(use_rank = stage_rank)
+
+    selected <- dplyr::bind_rows(selected, fallback_candidates)
+  }
+
+  selected |>
+    dplyr::filter(target_stage %in% stage_levels) |>
+    dplyr::arrange(target_stage, recommended_use, use_rank, stage_rank) |>
+    dplyr::distinct(target_stage, gene, .keep_all = TRUE)
+}
+
+build_validation_expression_summary <- function(validation_genes,
+                                                gene_stage_expression,
+                                                stage_levels) {
+  selected_genes <- unique(validation_genes$gene)
+
+  validation_summary <- gene_stage_expression |>
+    dplyr::filter(gene %in% selected_genes) |>
+    dplyr::left_join(
+      validation_genes |>
+        dplyr::select(
+          target_stage,
+          gene,
+          recommended_use,
+          marker_evidence_tier,
+          strict_weighted_score,
+          available_weighted_score,
+          regulatory_support_status
+        ),
+      by = "gene"
+    ) |>
+    dplyr::mutate(
+      alpha_stage = factor(alpha_stage, levels = stage_levels),
+      target_stage = factor(target_stage, levels = stage_levels),
+      is_target_stage = alpha_stage == target_stage
+    ) |>
+    dplyr::arrange(target_stage, gene, alpha_stage)
+
+  validation_matrix <- validation_summary |>
+    dplyr::select(target_stage, gene, alpha_stage, pct_expressing, mean_expression) |>
+    tidyr::pivot_wider(
+      id_cols = c(target_stage, gene),
+      names_from = alpha_stage,
+      values_from = c(pct_expressing, mean_expression),
+      names_glue = "{.value}_{alpha_stage}"
+    )
+
+  list(
+    validation_summary = validation_summary,
+    validation_matrix = validation_matrix
+  )
+}
+
+save_step6_plots <- function(seurat_obj,
+                             validation_genes,
+                             validation_summary,
+                             outputs,
+                             assay,
+                             stage_levels) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    return("ggplot2 not available; Step 6 plot files were not written.")
+  }
+
+  genes_to_plot <- unique(validation_genes$gene)
+  genes_to_plot <- genes_to_plot[genes_to_plot %in% rownames(seurat_obj)]
+
+  if (length(genes_to_plot) == 0) {
+    return("No validation genes were found in the Seurat object; Step 6 plots were not written.")
+  }
+
+  SeuratObject::DefaultAssay(seurat_obj) <- assay
+
+  dot_plot <- Seurat::DotPlot(
+    object = seurat_obj,
+    features = genes_to_plot,
+    group.by = "alpha_stage",
+    assay = assay
+  ) +
+    ggplot2::coord_flip() +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = "Candidate Alpha Maturation Marker Validation",
+      x = "Alpha stage",
+      y = "Candidate gene"
+    )
+
+  ggplot2::ggsave(
+    filename = outputs$dotplot,
+    plot = dot_plot,
+    width = 10,
+    height = max(6, length(genes_to_plot) * 0.18)
+  )
+
+  violin_plot <- Seurat::VlnPlot(
+    object = seurat_obj,
+    features = genes_to_plot,
+    group.by = "alpha_stage",
+    assay = assay,
+    pt.size = 0,
+    stack = TRUE,
+    flip = TRUE
+  ) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(title = "Candidate Marker Expression Distributions")
+
+  ggplot2::ggsave(
+    filename = outputs$violin_plot,
+    plot = violin_plot,
+    width = 10,
+    height = max(6, length(genes_to_plot) * 0.20)
+  )
+
+  heatmap_data <- validation_summary |>
+    dplyr::filter(gene %in% genes_to_plot) |>
+    dplyr::mutate(
+      alpha_stage = factor(alpha_stage, levels = stage_levels),
+      gene = factor(gene, levels = rev(unique(validation_genes$gene)))
+    )
+
+  heatmap_plot <- ggplot2::ggplot(
+    heatmap_data,
+    ggplot2::aes(x = alpha_stage, y = gene, fill = mean_expression)
+  ) +
+    ggplot2::geom_tile(color = "white", linewidth = 0.2) +
+    ggplot2::scale_fill_gradient(low = "white", high = "#B2182B") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = "Mean Expression of Candidate Markers by Alpha Stage",
+      x = "Alpha stage",
+      y = "Candidate gene",
+      fill = "Mean expression"
+    )
+
+  ggplot2::ggsave(
+    filename = outputs$heatmap_plot,
+    plot = heatmap_plot,
+    width = 8,
+    height = max(6, length(genes_to_plot) * 0.18)
+  )
+
+  paste("Step 6 plot files written for", length(genes_to_plot), "genes.")
+}
+```
+
+```{r step6-build-validation-package}
+validation_gene_set <- select_validation_markers(
+  stage_panel = stage_marker_panel,
+  review_table = marker_review_table,
+  stage_levels = alpha_stage_levels,
+  primary_n = validation_primary_n_per_stage,
+  secondary_n = validation_secondary_n_per_stage
+)
+
+validation_expression <- build_validation_expression_summary(
+  validation_genes = validation_gene_set,
+  gene_stage_expression = gene_stage_expression,
+  stage_levels = alpha_stage_levels
+)
+
+step6_plot_status <- save_step6_plots(
+  seurat_obj = human_combined_alpha_ready,
+  validation_genes = validation_gene_set,
+  validation_summary = validation_expression$validation_summary,
+  outputs = step6_outputs,
+  assay = analysis_assay,
+  stage_levels = alpha_stage_levels
+)
+
+write_step6_csv(validation_gene_set, step6_outputs$validation_gene_set)
+write_step6_csv(validation_expression$validation_summary, step6_outputs$validation_summary)
+write_step6_csv(validation_expression$validation_matrix, step6_outputs$validation_matrix)
+
+project_state_step6 <- list(
+  created_at = Sys.time(),
+  project_root = project_root,
+  validation_primary_n_per_stage = validation_primary_n_per_stage,
+  validation_secondary_n_per_stage = validation_secondary_n_per_stage,
+  n_validation_genes = dplyr::n_distinct(validation_gene_set$gene),
+  step6_outputs = step6_outputs,
+  plot_status = step6_plot_status,
+  session_info = utils::sessionInfo()
+)
+
+saveRDS(project_state_step6, step6_outputs$state)
+
+write_step6_lines(
+  c(
+    "Step 6 completed: candidate marker expression validation package generated.",
+    paste("Validation gene set:", step6_outputs$validation_gene_set),
+    paste("Validation summary:", step6_outputs$validation_summary),
+    paste("Validation matrix:", step6_outputs$validation_matrix),
+    paste("Plot status:", step6_plot_status),
+    paste("Validation genes:", project_state_step6$n_validation_genes)
+  )
+)
+```
+
+```{r step6-display-summary}
+validation_gene_set |>
+  dplyr::count(target_stage, recommended_use, marker_evidence_tier)
+
+validation_expression$validation_summary |>
+  dplyr::filter(is_target_stage) |>
+  dplyr::arrange(target_stage, dplyr::desc(pct_expressing), dplyr::desc(mean_expression)) |>
+  dplyr::select(
+    target_stage,
+    gene,
+    recommended_use,
+    marker_evidence_tier,
+    pct_expressing,
+    mean_expression,
+    regulatory_support_status
+  )
+```
+
+---
+
+# Step 7 - Follow-Up Marker Candidate Nomination
+
+Step 7 turns the review and validation outputs into a conservative follow-up
+nomination package. These are not final biological marker calls. They are ranked
+candidate nominations with explicit decision reasons, intended for manual review,
+orthogonal dataset checks, antibody feasibility review, or experimental
+validation planning.
+
+```{r step7-config}
+step7_outputs <- list(
+  nomination_table = file.path(output_dirs$tables, "marker_followup_nomination_table_step7.csv"),
+  stage_shortlist = file.path(output_dirs$tables, "marker_followup_shortlist_by_stage_step7.csv"),
+  decision_summary = file.path(output_dirs$tables, "marker_followup_decision_summary_step7.csv"),
+  methods_note = file.path(output_dirs$logs, "marker_nomination_methods_note_step7.md"),
+  status = file.path(output_dirs$state, "step7_status.txt"),
+  state = file.path(output_dirs$state, "project_state_step7.rds")
+)
+
+followup_shortlist_n_per_stage <- 15
+validation_min_target_pct <- 0.20
+validation_min_pct_margin <- 0.10
+validation_min_mean_log2_fc <- 0.25
+```
+
+```{r step7-helpers}
+write_step7_csv <- function(data, path) {
+  readr::write_csv(data, path)
+}
+
+write_step7_lines <- function(lines, path = step7_outputs$status) {
+  writeLines(lines, con = path)
+}
+
+build_validation_pattern_summary <- function(validation_summary,
+                                             min_target_pct = 0.20,
+                                             min_pct_margin = 0.10,
+                                             min_mean_log2_fc = 0.25,
+                                             pseudocount = 0.05) {
+  target_expression <- validation_summary |>
+    dplyr::filter(is_target_stage) |>
+    dplyr::select(
+      target_stage,
+      gene,
+      target_pct_expressing_validation = pct_expressing,
+      target_mean_expression_validation = mean_expression
+    )
+
+  background_expression <- validation_summary |>
+    dplyr::filter(!is_target_stage) |>
+    dplyr::group_by(target_stage, gene) |>
+    dplyr::summarise(
+      max_background_pct_expressing_validation = max(pct_expressing, na.rm = TRUE),
+      max_background_mean_expression_validation = max(mean_expression, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  target_expression |>
+    dplyr::left_join(background_expression, by = c("target_stage", "gene")) |>
+    dplyr::mutate(
+      max_background_pct_expressing_validation = dplyr::coalesce(
+        max_background_pct_expressing_validation,
+        0
+      ),
+      max_background_mean_expression_validation = dplyr::coalesce(
+        max_background_mean_expression_validation,
+        0
+      ),
+      validation_pct_margin = target_pct_expressing_validation -
+        max_background_pct_expressing_validation,
+      validation_mean_log2_fc = log2(
+        (target_mean_expression_validation + pseudocount) /
+          (max_background_mean_expression_validation + pseudocount)
+      ),
+      # Validation pattern labels separate strong stage-restricted expression
+      # from broad alpha expression and weak/sparse detection. These labels are
+      # used downstream as decision evidence, not as final biological truth.
+      validation_pattern = dplyr::case_when(
+        target_pct_expressing_validation >= min_target_pct &
+          validation_pct_margin >= min_pct_margin &
+          validation_mean_log2_fc >= min_mean_log2_fc ~ "stage_enriched",
+        target_pct_expressing_validation >= min_target_pct &
+          validation_pct_margin < min_pct_margin ~ "broad_alpha_expression",
+        target_pct_expressing_validation < min_target_pct ~ "weak_or_sparse",
+        TRUE ~ "mixed_pattern"
+      )
+    )
+}
+
+build_followup_nomination_table <- function(review_table,
+                                            validation_patterns) {
+  review_table |>
+    dplyr::inner_join(
+      validation_patterns,
+      by = c("target_stage", "gene")
+    ) |>
+    dplyr::mutate(
+      # Decision logic is intentionally conservative and order-dependent:
+      # 1) technical caveats and sparse validation block advancement;
+      # 2) Tier 1 + stage-enriched candidates advance first;
+      # 3) strong expression-supported candidates are reserved for secondary
+      #    review when regulatory support is still pending;
+      # 4) broad-expression genes are retained only as contextual markers.
+      followup_decision = dplyr::case_when(
+        technical_caveat != "none" ~ "do_not_prioritize",
+        validation_pattern == "weak_or_sparse" ~ "do_not_prioritize",
+        marker_evidence_tier == "Tier 1 - regulatory supported" &
+          validation_pattern == "stage_enriched" ~ "advance",
+        marker_evidence_tier == "Tier 2 - expression supported" &
+          validation_pattern == "stage_enriched" ~ "reserve_expression_supported",
+        validation_pattern == "broad_alpha_expression" ~ "contextual_broad_alpha",
+        marker_evidence_tier == "Tier 3 - exploratory" &
+          validation_pattern %in% c("stage_enriched", "mixed_pattern") ~ "exploratory_followup",
+        TRUE ~ "reserve_low_confidence"
+      ),
+      decision_reason = dplyr::case_when(
+        technical_caveat != "none" ~ paste("Excluded caveat:", technical_caveat),
+        validation_pattern == "weak_or_sparse" ~ "Low target-stage detection in validation summary.",
+        followup_decision == "advance" ~ "Regulatory-supported tier and stage-enriched validation pattern.",
+        followup_decision == "reserve_expression_supported" ~
+          "Expression-supported and stage-enriched; regulatory support pending or below Tier 1.",
+        followup_decision == "contextual_broad_alpha" ~
+          "Detected in target stage but also broad across alpha stages.",
+        followup_decision == "exploratory_followup" ~
+          "Exploratory evidence with some validation support.",
+        TRUE ~ "Lower-confidence evidence profile."
+      ),
+      nomination_rank_score = dplyr::case_when(
+        followup_decision == "advance" ~ strict_weighted_score,
+        TRUE ~ available_weighted_score
+      )
+    ) |>
+    dplyr::group_by(target_stage) |>
+    dplyr::arrange(
+      target_stage,
+      dplyr::desc(followup_decision == "advance"),
+      dplyr::desc(followup_decision == "reserve_expression_supported"),
+      dplyr::desc(nomination_rank_score),
+      dplyr::desc(validation_pct_margin),
+      gene,
+      .by_group = TRUE
+    ) |>
+    dplyr::mutate(nomination_stage_rank = dplyr::row_number()) |>
+    dplyr::ungroup() |>
+    dplyr::select(
+      target_stage,
+      nomination_stage_rank,
+      gene,
+      followup_decision,
+      decision_reason,
+      validation_pattern,
+      recommended_use,
+      marker_evidence_tier,
+      strict_weighted_score,
+      available_weighted_score,
+      regulatory_support_status,
+      regulatory_support_score,
+      expression_robustness_score,
+      stage_specificity_score,
+      target_pct_expressing_validation,
+      max_background_pct_expressing_validation,
+      validation_pct_margin,
+      target_mean_expression_validation,
+      max_background_mean_expression_validation,
+      validation_mean_log2_fc,
+      technical_caveat,
+      dplyr::everything()
+    )
+}
+
+build_followup_shortlist <- function(nomination_table, n_per_stage = 15) {
+  nomination_table |>
+    dplyr::filter(
+      followup_decision %in% c(
+        "advance",
+        "reserve_expression_supported",
+        "exploratory_followup"
+      )
+    ) |>
+    dplyr::group_by(target_stage) |>
+    dplyr::arrange(nomination_stage_rank, .by_group = TRUE) |>
+    dplyr::slice_head(n = n_per_stage) |>
+    dplyr::ungroup()
+}
+
+summarize_followup_decisions <- function(nomination_table) {
+  nomination_table |>
+    dplyr::group_by(target_stage, followup_decision, validation_pattern) |>
+    dplyr::summarise(
+      n_genes = dplyr::n(),
+      median_nomination_score = stats::median(nomination_rank_score, na.rm = TRUE),
+      n_regulatory_supported = sum(regulatory_support_status == "available"),
+      .groups = "drop"
+    ) |>
+    dplyr::arrange(target_stage, followup_decision, validation_pattern)
+}
+
+write_methods_note_step7 <- function(outputs,
+                                     shortlist_n,
+                                     min_target_pct,
+                                     min_pct_margin,
+                                     min_mean_log2_fc) {
+  note_lines <- c(
+    "# Step 7 Marker Nomination Methods Note",
+    "",
+    "Candidate nominations were generated from the Step 5 review table and Step 6 validation expression summaries.",
+    "A candidate was treated as stage-enriched only when the target-stage detection fraction, target-vs-background detection margin, and target-vs-background mean-expression log2 fold change passed the configured thresholds.",
+    "",
+    paste("- Follow-up shortlist size per stage:", shortlist_n),
+    paste("- Minimum target-stage fraction expressing:", min_target_pct),
+    paste("- Minimum target-vs-background fraction margin:", min_pct_margin),
+    paste("- Minimum target-vs-background mean-expression log2 fold change:", min_mean_log2_fc),
+    "",
+    "Nominations are not final biological marker calls. They are ranked follow-up candidates for manual review, orthogonal dataset validation, antibody/probe feasibility review, and experimental planning."
+  )
+
+  writeLines(note_lines, con = outputs$methods_note)
+}
+```
+
+```{r step7-build-nominations}
+validation_pattern_summary <- build_validation_pattern_summary(
+  validation_summary = validation_expression$validation_summary,
+  min_target_pct = validation_min_target_pct,
+  min_pct_margin = validation_min_pct_margin,
+  min_mean_log2_fc = validation_min_mean_log2_fc,
+  pseudocount = effect_size_pseudocount
+)
+
+followup_nomination_table <- build_followup_nomination_table(
+  review_table = marker_review_table,
+  validation_patterns = validation_pattern_summary
+)
+
+followup_stage_shortlist <- build_followup_shortlist(
+  nomination_table = followup_nomination_table,
+  n_per_stage = followup_shortlist_n_per_stage
+)
+
+followup_decision_summary <- summarize_followup_decisions(followup_nomination_table)
+
+write_step7_csv(followup_nomination_table, step7_outputs$nomination_table)
+write_step7_csv(followup_stage_shortlist, step7_outputs$stage_shortlist)
+write_step7_csv(followup_decision_summary, step7_outputs$decision_summary)
+
+write_methods_note_step7(
+  outputs = step7_outputs,
+  shortlist_n = followup_shortlist_n_per_stage,
+  min_target_pct = validation_min_target_pct,
+  min_pct_margin = validation_min_pct_margin,
+  min_mean_log2_fc = validation_min_mean_log2_fc
+)
+
+project_state_step7 <- list(
+  created_at = Sys.time(),
+  project_root = project_root,
+  followup_shortlist_n_per_stage = followup_shortlist_n_per_stage,
+  validation_min_target_pct = validation_min_target_pct,
+  validation_min_pct_margin = validation_min_pct_margin,
+  validation_min_mean_log2_fc = validation_min_mean_log2_fc,
+  n_nomination_rows = nrow(followup_nomination_table),
+  n_shortlist_rows = nrow(followup_stage_shortlist),
+  step7_outputs = step7_outputs,
+  decision_summary = followup_decision_summary,
+  session_info = utils::sessionInfo()
+)
+
+saveRDS(project_state_step7, step7_outputs$state)
+
+write_step7_lines(
+  c(
+    "Step 7 completed: follow-up marker candidate nominations generated.",
+    paste("Nomination table:", step7_outputs$nomination_table),
+    paste("Stage shortlist:", step7_outputs$stage_shortlist),
+    paste("Decision summary:", step7_outputs$decision_summary),
+    paste("Methods note:", step7_outputs$methods_note),
+    paste("Nomination rows:", nrow(followup_nomination_table)),
+    paste("Shortlist rows:", nrow(followup_stage_shortlist))
+  )
+)
+```
+
+```{r step7-display-summary}
+followup_decision_summary
+
+followup_stage_shortlist |>
+  dplyr::select(
+    target_stage,
+    nomination_stage_rank,
+    gene,
+    followup_decision,
+    validation_pattern,
+    marker_evidence_tier,
+    nomination_rank_score,
+    regulatory_support_status
+  )
+```
+
+---
+
+# Step 8 - Final Reproducible Handoff Package
+
+Step 8 finalizes the alpha maturation marker scoring workflow by collecting the
+key output files, writing a run manifest, exporting a final follow-up shortlist,
+and generating a concise markdown report. This is a reproducibility and handoff
+step; it does not change candidate scores or promote nominations to final
+biological marker calls.
+
+```{r step8-config}
+step8_outputs <- list(
+  output_manifest = file.path(output_dirs$logs, "workflow_output_manifest_step8.csv"),
+  final_summary = file.path(output_dirs$tables, "workflow_final_summary_step8.csv"),
+  final_shortlist = file.path(output_dirs$tables, "final_marker_followup_shortlist_step8.csv"),
+  final_report = file.path(output_dirs$logs, "alpha_maturation_marker_scoring_final_report_step8.md"),
+  final_state = file.path(output_dirs$state, "project_state_step8_final.rds"),
+  status = file.path(output_dirs$state, "step8_status.txt")
+)
+```
+
+```{r step8-helpers}
+write_step8_csv <- function(data, path) {
+  readr::write_csv(data, path)
+}
+
+write_step8_lines <- function(lines, path = step8_outputs$status) {
+  writeLines(lines, con = path)
+}
+
+make_output_manifest <- function(...) {
+  output_lists <- list(...)
+
+  manifest_parts <- lapply(names(output_lists), function(step_name) {
+    step_outputs <- output_lists[[step_name]]
+
+    tibble::tibble(
+      step = step_name,
+      output_name = names(step_outputs),
+      path = unname(unlist(step_outputs, use.names = FALSE))
+    )
+  })
+
+  dplyr::bind_rows(manifest_parts) |>
+    dplyr::mutate(
+      exists = file.exists(path),
+      size_mb = dplyr::if_else(
+        exists,
+        round(file.info(path)$size / 1024^2, 3),
+        NA_real_
+      ),
+      modified_time = dplyr::if_else(
+        exists,
+        as.character(file.info(path)$mtime),
+        NA_character_
+      )
+    ) |>
+    dplyr::arrange(step, output_name)
+}
+
+build_final_summary <- function() {
+  tibble::tibble(
+    summary_metric = c(
+      "alpha_cells",
+      "alpha_genes",
+      "candidate_gene_stage_rows",
+      "review_table_rows",
+      "validation_genes",
+      "followup_nomination_rows",
+      "followup_shortlist_rows",
+      "regulatory_supported_genes",
+      "advanced_candidates"
+    ),
+    value = as.character(c(
+      ncol(human_combined_alpha_ready),
+      nrow(human_combined_alpha_ready),
+      nrow(gene_stage_marker_scores_step4),
+      nrow(marker_review_table),
+      dplyr::n_distinct(validation_gene_set$gene),
+      nrow(followup_nomination_table),
+      nrow(followup_stage_shortlist),
+      sum(regulatory_support_scores$regulatory_support_status == "available"),
+      sum(followup_nomination_table$followup_decision == "advance")
+    ))
+  )
+}
+
+build_final_shortlist <- function(shortlist_table) {
+  shortlist_table |>
+    dplyr::arrange(target_stage, nomination_stage_rank) |>
+    dplyr::select(
+      target_stage,
+      nomination_stage_rank,
+      gene,
+      followup_decision,
+      decision_reason,
+      validation_pattern,
+      marker_evidence_tier,
+      strict_weighted_score,
+      available_weighted_score,
+      regulatory_support_status,
+      expression_robustness_score,
+      stage_specificity_score,
+      validation_pct_margin,
+      validation_mean_log2_fc,
+      technical_caveat
+    )
+}
+
+write_final_report <- function(outputs,
+                               final_summary,
+                               decision_summary,
+                               output_manifest) {
+  summary_lines <- paste0(
+    "- ", final_summary$summary_metric, ": ", final_summary$value
+  )
+
+  decision_lines <- if (nrow(decision_summary) == 0) {
+    "- No follow-up decisions were generated."
+  } else {
+    apply(decision_summary, 1, function(row) {
+      paste0(
+        "- ", row[["target_stage"]], " | ", row[["followup_decision"]],
+        " | ", row[["validation_pattern"]], ": ", row[["n_genes"]], " genes"
+      )
+    })
+  }
+
+  missing_outputs <- output_manifest |>
+    dplyr::filter(!exists) |>
+    dplyr::mutate(label = paste0("- ", step, " / ", output_name, ": ", path)) |>
+    dplyr::pull(label)
+
+  if (length(missing_outputs) == 0) {
+    missing_outputs <- "- No missing registered outputs at report-generation time."
+  }
+
+  # This report deliberately separates evidence-backed nominations from final
+  # marker claims. That distinction is important for publication-quality
+  # bioinformatics: computational prioritization should be reviewed against
+  # biological context, independent datasets, and validation feasibility.
+  report_lines <- c(
+    "# Alpha Maturation Marker Scoring Final Report",
+    "",
+    paste("Generated:", as.character(Sys.time())),
+    "",
+    "## Scope",
+    "",
+    "This workflow starts from the existing integrated alpha cell object and builds a downstream marker scoring, regulatory support, validation, and nomination package. It does not re-run upstream scRNA-seq preprocessing, integration, clustering, or alpha subsetting.",
+    "",
+    "## Final Summary",
+    "",
+    summary_lines,
+    "",
+    "## Follow-Up Decision Summary",
+    "",
+    decision_lines,
+    "",
+    "## Key Final Outputs",
+    "",
+    paste("- Output manifest:", outputs$output_manifest),
+    paste("- Final shortlist:", outputs$final_shortlist),
+    paste("- Final summary:", outputs$final_summary),
+    "",
+    "## Missing Registered Outputs",
+    "",
+    missing_outputs,
+    "",
+    "## Interpretation Note",
+    "",
+    "The final shortlist contains computational follow-up nominations, not final validated biomarkers. Candidate genes should be reviewed for biological plausibility, orthogonal dataset support, stage specificity outside the current integrated object, and experimental validation feasibility before publication claims are made."
+  )
+
+  writeLines(report_lines, con = outputs$final_report)
+}
+```
+
+```{r step8-finalize-handoff}
+workflow_output_manifest <- make_output_manifest(
+  step2 = step2_outputs,
+  step3 = step3_outputs,
+  step4 = step4_outputs,
+  step5 = step5_outputs,
+  step6 = step6_outputs,
+  step7 = step7_outputs,
+  step8 = step8_outputs
+)
+
+workflow_final_summary <- build_final_summary()
+final_marker_followup_shortlist <- build_final_shortlist(followup_stage_shortlist)
+
+write_step8_csv(workflow_output_manifest, step8_outputs$output_manifest)
+write_step8_csv(workflow_final_summary, step8_outputs$final_summary)
+write_step8_csv(final_marker_followup_shortlist, step8_outputs$final_shortlist)
+
+write_final_report(
+  outputs = step8_outputs,
+  final_summary = workflow_final_summary,
+  decision_summary = followup_decision_summary,
+  output_manifest = workflow_output_manifest
+)
+
+project_state_step8 <- list(
+  created_at = Sys.time(),
+  project_root = project_root,
+  workflow_complete_through_step = 8,
+  alpha_stage_levels = alpha_stage_levels,
+  final_summary = workflow_final_summary,
+  output_manifest = workflow_output_manifest,
+  step8_outputs = step8_outputs,
+  session_info = utils::sessionInfo()
+)
+
+saveRDS(project_state_step8, step8_outputs$final_state)
+
+write_step8_lines(
+  c(
+    "Step 8 completed: final reproducible handoff package generated.",
+    paste("Output manifest:", step8_outputs$output_manifest),
+    paste("Final summary:", step8_outputs$final_summary),
+    paste("Final shortlist:", step8_outputs$final_shortlist),
+    paste("Final report:", step8_outputs$final_report),
+    paste("Registered outputs:", nrow(workflow_output_manifest)),
+    paste("Missing registered outputs:", sum(!workflow_output_manifest$exists))
+  )
+)
+```
+
+```{r step8-display-summary}
+workflow_final_summary
+
+final_marker_followup_shortlist |>
+  dplyr::group_by(target_stage) |>
+  dplyr::slice_head(n = 15) |>
+  dplyr::ungroup()
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

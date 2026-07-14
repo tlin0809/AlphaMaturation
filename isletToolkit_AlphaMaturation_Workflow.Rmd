@@ -1,0 +1,1287 @@
+---
+title: "isletToolkit — Pancreatic Islet Cell Developmental Transcriptomics Workflow"
+author: "Traye Lin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Overview
+
+This workflow covers the full analysis pipeline for human islet cell maturation across developmental stages (fetal, child, adult). Glucagon-expressing Alpha cells are used here as target cell population for example. 
+
+  **Part 1 — Upstream (user-managed):** Data loading, QC, per-dataset
+  preprocessing, cell type labeling, RPCA integration, and alpha subset isolation.
+
+  **Part 2 — isletToolkit functions:** Pairwise differential expression (DE),
+  volcano visualization, gene-gene co-expression network construction, Leiden
+  community detection, GO over-representation analysis (ORA), motif enrichment
+  (RcisTarget), and TF regulatory network visualization.
+
+Sections are organized as self-contained chunks. Intermediate objects are saved
+to disk after computationally expensive steps so the workflow can be resumed at
+any point without re-running from scratch.
+
+---
+
+# Part 1 — Upstream Analysis (User-Managed)
+
+> These steps are dataset-specific and are NOT part of the isletToolkit package.
+> They are documented here for full reproducibility.
+
+## 1.1 — Load Libraries
+```{r}
+# THIS IS FOR ME ONLY
+setwd("\\\\fs\\teams\\LynnLabNew\\Lab_Member_Folders\\Traye\\MaturationMarker_New")
+```
+
+
+```{r load-libraries}
+library(data.table)
+library(Matrix)
+library(Seurat)
+library(SeuratObject)
+library(zellkonverter)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(patchwork)
+library(RColorBrewer)
+library(igraph)
+library(ggraph)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(RcisTarget)
+
+# Optional: install packages not yet available
+required_pkgs <- c(
+  "data.table", "Matrix", "Seurat", "SeuratObject", "zellkonverter", "stringr",
+  "dplyr", "tibble", "tidyr", "ggplot2", "ggrepel", "ggpubr", "patchwork",
+  "RColorBrewer", "igraph", "ggraph", "clusterProfiler", "org.Hs.eg.db", "RcisTarget"
+)
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    message("Installing: ", pkg)
+    install.packages(pkg)
+  }
+}
+```
+
+---
+
+## 1.2 — Load & Preprocess Human Fetal Islets (Persaud; GSE197064)
+
+> Raw data: multi-modal long-format `.csv.gz` files (5 columns: barcode,
+> feature_id, feature_name, feature_type, count). One file per GSM sample.
+
+```{r load-fetal}
+# ---- User: set path to the directory containing GSE197064 raw files ----
+raw_dir_fetal <- "//fs/teams/LynnLabNew/Lab_Member_Folders/Traye/RNAseq Integration/data/Human development/Fetal/GSE197064_RAW"
+dir.exists(raw_dir_fetal) 
+
+# List sample files
+final_files <- list.files(raw_dir_fetal, pattern = "_final_matrix\\.csv\\.gz$", full.names = TRUE)
+length(final_files)
+
+# Helper: parse long-format multi-modal matrix into a Seurat object
+read_final_matrix_multi <- function(f) {
+  dt <- data.table::fread(
+    f,
+    header    = FALSE,
+    col.names = c("barcode", "feature_id", "feature_name", "feature_type", "count")
+  )
+
+  # Build a sparse matrix from a subset of the long-format table
+  make_sparse <- function(sub_dt, feature_col = c("feature_name", "feature_id")) {
+    feature_col <- match.arg(feature_col)
+    genes <- unique(sub_dt[[feature_col]])
+    cells <- unique(sub_dt$barcode)
+    sparseMatrix(
+      i        = match(sub_dt[[feature_col]], genes),
+      j        = match(sub_dt$barcode, cells),
+      x        = sub_dt$count,
+      dims     = c(length(genes), length(cells)),
+      dimnames = list(genes, cells)
+    )
+  }
+
+  # Split by modality
+  rna_dt <- dt[feature_type %in% c("Gene Expression", "GeneExpression", "RNA")]
+  adt_dt <- dt[feature_type %in% c("Antibody Capture", "AntibodyCapture", "ADT")]
+
+  if (nrow(rna_dt) == 0) {
+    stop("No Gene Expression rows found. Available feature_types: ",
+         paste(unique(dt$feature_type), collapse = ", "))
+  }
+
+  rna_mat <- make_sparse(rna_dt, feature_col = "feature_name")
+  seu      <- CreateSeuratObject(counts = rna_mat)
+
+  # Optionally add ADT assay
+  if (nrow(adt_dt) > 0) {
+    adt_mat      <- make_sparse(adt_dt, feature_col = "feature_id")
+    seu[["ADT"]] <- CreateAssayObject(counts = adt_mat)
+  }
+
+  return(seu)
+}
+
+# Load all samples and merge
+objs <- list()
+for (f in final_files) {
+  gsm_id          <- str_extract(basename(f), "GSM\\d+")
+  message("Loading: ", gsm_id)
+  obj             <- read_final_matrix_multi(f)
+  obj$GSM         <- gsm_id
+  objs[[gsm_id]]  <- obj
+}
+
+HI_fetal <- Reduce(function(x, y) merge(x, y), objs)
+HI_fetal <- JoinLayers(HI_fetal)
+
+# Standard preprocessing
+HI_fetal <- NormalizeData(HI_fetal)        %>%
+            FindVariableFeatures()         %>%
+            ScaleData()                    %>%
+            RunPCA()                       %>%
+            RunUMAP(dims = 1:30)           %>%
+            FindNeighbors(dims = 1:30)     %>%
+            FindClusters(resolution = 1.4)
+
+# ---- Inspect FeaturePlot(HI_fetal, features = c("GCG","INS","SST","TPH1"))
+# and update cluster-to-label mapping below before running RenameIdents ----
+
+# Example label mapping — update cluster IDs to match your UMAP
+fetal_cluster_labels <- c(
+  "0"  = "Other (fetal)", "1"  = "Other (fetal)", "2"  = "Other (fetal)",
+  "3"  = "Other (fetal)", "4"  = "Other (fetal)", "5"  = "Other (fetal)",
+  "6"  = "Beta (fetal)",  "7"  = "Other (fetal)", "8"  = "Other (fetal)",
+  "9"  = "Alpha (fetal)", "10" = "Other (fetal)"
+  # ... extend to all clusters
+)
+HI_fetal <- RenameIdents(HI_fetal, fetal_cluster_labels)
+
+dir.create("output", showWarnings = FALSE) 
+saveRDS(HI_fetal, "output/HI_fetal_labeled.rds")
+# HI_fetal <- readRDS("output/HI_fetal_labeled.rds")
+```
+
+---
+
+## 1.3 — Load & Preprocess Human Child Islets (Sander; GSE202494)
+
+> Raw data: `.h5ad` format. All samples in this dataset are child islets —
+> no subsetting by `orig.ident` is needed.
+
+```{r load-child}
+# ---- User: set path to the raw .h5ad file ----
+sce_child <- zellkonverter::readH5AD("\\\\fs\\teams\\LynnLabNew\\Lab_Member_Folders\\Traye\\RNAseq Integration\\data\\Human development\\Child\\GSE202494_raw.h5ad")
+HI_child  <- as.Seurat(sce_child, counts = "X", data = "X")
+HI_child$orig.ident <- "Child"
+
+# QC: inspect VlnPlot(HI_child, features = c("nFeature_originalexp","nCount_originalexp","percent_mito"))
+HI_child <- subset(HI_child, subset = nCount_originalexp < 40000 & nFeature_originalexp < 6000)
+message("Child islet cells after QC: ", ncol(HI_child))
+
+# Standard preprocessing (note: assay is "originalexp" for h5ad-converted objects)
+HI_child <- NormalizeData(HI_child, verbose = FALSE)      %>%
+            FindVariableFeatures(verbose = FALSE)          %>%
+            ScaleData(verbose = FALSE)                     %>%
+            RunPCA(verbose = FALSE)                        %>%
+            FindNeighbors(dims = 1:30, reduction = "pca")  %>%
+            FindClusters(resolution = 0.6)                 %>%
+            RunUMAP(dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+
+# ---- User: inspect FeaturePlot(HI_child, features = c("GCG","INS","SST","PPY"))
+# and update label mapping below ----
+
+child_cluster_labels <- c(
+  "0"  = "Beta (child)",  "1"  = "Alpha (child)", "2"  = "Delta (child)",
+  "3"  = "Beta (child)",  "4"  = "Beta (child)",  "5"  = "Beta (child)",
+  "6"  = "Beta (child)",  "7"  = "Beta (child)",  "8"  = "Alpha (child)",
+  "9"  = "Delta (child)", "10" = "Alpha (child)", "11" = "Other (child)",
+  "12" = "Other (child)"
+)
+HI_child <- RenameIdents(HI_child, child_cluster_labels)
+
+saveRDS(HI_child, "output/HI_child_labeled.rds")
+# HI_child <- readRDS("output/HI_child_labeled.rds")
+```
+
+---
+
+## 1.4 — Load & Preprocess Human Adult Islets (HPAP; GSE202491)
+
+> Raw data: `.h5ad` format. This dataset includes both HPAP primary and SC-derived
+> cells; only HPAP cells are retained.
+
+```{r load-adult}
+# ---- User: set path to the raw .h5ad file ----
+sce_adult  <- zellkonverter::readH5AD("\\\\fs\\teams\\LynnLabNew\\Lab_Member_Folders\\Traye\\RNAseq Integration\\data\\Human development\\Adult\\GSE202491_raw.h5ad")
+HI_adult   <- as.Seurat(sce_adult, counts = "X", data = "X")
+
+# Retain only primary HPAP adult cells
+HI_adult   <- subset(HI_adult, orig.ident == "HPAP")
+HI_adult$orig.ident <- "Adult"
+
+# QC
+HI_adult <- subset(HI_adult, subset = nCount_originalexp < 100000)
+message("Adult islet cells after QC: ", ncol(HI_adult))
+
+# Standard preprocessing
+HI_adult <- NormalizeData(HI_adult, verbose = FALSE)      %>%
+            FindVariableFeatures(verbose = FALSE)          %>%
+            ScaleData(verbose = FALSE)                     %>%
+            RunPCA(verbose = FALSE)                        %>%
+            FindNeighbors(dims = 1:30, reduction = "pca")  %>%
+            FindClusters(resolution = 0.6)                 %>%
+            RunUMAP(dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+
+# ---- User: inspect marker genes and update label mapping below ----
+
+adult_cluster_labels <- c(
+  "0"  = "Beta",  "1"  = "Alpha", "2"  = "Beta",  "3"  = "Alpha",
+  "4"  = "Alpha", "5"  = "Alpha", "6"  = "Alpha",  "7"  = "Alpha",
+  "8"  = "Alpha", "9"  = "Alpha", "10" = "Alpha",  "11" = "Beta",
+  "12" = "Beta",  "13" = "Beta",  "14" = "Beta",   "15" = "Alpha",
+  "16" = "Beta",  "17" = "Beta",  "18" = "Delta",  "19" = "Alpha",
+  "20" = "Beta",  "21" = "Other", "22" = "Alpha",  "23" = "Delta",
+  "24" = "PP"
+)
+HI_adult <- RenameIdents(HI_adult, adult_cluster_labels)
+
+saveRDS(HI_adult, "output/HI_adult_labeled.rds")
+# HI_adult <- readRDS("output/HI_adult_labeled.rds")
+```
+
+---
+
+## 1.5 — RPCA Integration of All Three Datasets
+
+> Because the three datasets were generated with different protocols, RPCA
+> integration is used to remove batch effects before joint analysis.
+
+```{r integrate}
+# Reload labeled objects if resuming
+HI_fetal <- readRDS("output/HI_fetal_labeled.rds")
+HI_child <- readRDS("output/HI_child_labeled.rds")
+HI_adult <- readRDS("output/HI_adult_labeled.rds")
+
+# Rename the "originalexp" assay in child and adult to "RNA" for consistency
+HI_child[["RNA"]] <- HI_child[["originalexp"]]
+HI_adult[["RNA"]] <- HI_adult[["originalexp"]]
+DefaultAssay(HI_child) <- "RNA"
+DefaultAssay(HI_adult) <- "RNA"
+DefaultAssay(HI_fetal) <- "RNA"
+
+# Ensure orig.ident labels are set correctly before integration
+HI_fetal$orig.ident <- "Fetal"
+
+# Pre-process each object separately before finding anchors
+human_list <- list(HI_fetal, HI_child, HI_adult)
+human_list <- lapply(human_list, function(x) {
+  x <- NormalizeData(x, verbose = FALSE)
+  x <- FindVariableFeatures(x, verbose = FALSE)
+  return(x)
+})
+
+# Find integration anchors using RPCA (robust to large cell number differences)
+anchors <- FindIntegrationAnchors(
+  object.list = human_list,
+  reduction   = "rpca",
+  dims        = 1:30
+)
+
+# Integrate datasets
+human_combined <- IntegrateData(anchorset = anchors, dims = 1:30)
+
+# Run standard workflow on the integrated assay
+DefaultAssay(human_combined) <- "integrated"
+human_combined <- ScaleData(human_combined, verbose = FALSE) %>%
+                  RunPCA(verbose = FALSE)                    %>%
+                  RunUMAP(dims = 1:30)                       %>%
+                  FindNeighbors(dims = 1:30)                 %>%
+                  FindClusters()
+
+saveRDS(human_combined, "output/human_combined_integrated_unlabeled.rds")
+# human_combined <- readRDS("output/human_combined_integrated_unlabeled.rds")
+```
+
+---
+
+## 1.6 — Label Integrated Clusters
+
+> Use VlnPlot/FeaturePlot with the canonical marker panel below to assign
+> identities. Some fetal clusters have composite names reflecting gene
+> expression signatures (e.g., "Fetal SOX4+/VIM+/SERPINE2+").
+
+```{r label-integrated}
+# Canonical marker panel — use for labeling via VlnPlot or FeaturePlot
+markers_canonical <- c(
+  "GCG", "GC", "TTR", "IRX2", "ARX",           # Alpha
+  "INS", "IAPP", "HADH", "PDX1", "NKX6-1",     # Beta
+  "SST", "HHEX", "LEPR",                        # Delta
+  "PPY", "AQP3", "MEIS1",                       # PP
+  "GHRL", "ASCL1", "TM4SF5",                    # Epsilon
+  "NKX2-2", "NEUROG3", "SOX4",                  # Progenitor
+  "TPH1", "FEV", "LMX1A",                       # EC
+  "TOP2A", "CENPF", "PCNA",                     # Proliferating
+  "GAP43", "RTN1", "CNTNAP2",                   # Neuro-endocrine
+  "KRT19", "ANXA4", "CFTR",                     # Duct
+  "CDKN1A", "CDKN2A", "SERPINE2",               # Senescent
+  "VIM", "SPARC", "COL3A1",                     # Mesenchyme
+  "PRSS1", "CTRB2", "CPA1"                      # Acinar
+)
+
+# ---- User: inspect and update cluster-to-label mapping below ----
+# VlnPlot(human_combined, stack=TRUE, flip=TRUE, fill.by="ident", features=markers_canonical)
+
+integrated_cluster_labels <- c(
+  "0"  = "Adult alpha",              "1"  = "Fetal SOX4+/VIM+",
+  "2"  = "Fetal acinar",             "3"  = "Fetal SOX4+/VIM+",
+  "4"  = "Fetal beta",               "5"  = "Adult beta",
+  "6"  = "Fetal SOX4+/VIM+",        "7"  = "Fetal SOX4+/VIM+",
+  "8"  = "Fetal VIM+",              "9"  = "Child beta",
+  "10" = "Adult alpha",             "11" = "Adult beta",
+  "12" = "Adult beta",              "13" = "Fetal other",
+  "14" = "Fetal SOX4+/VIM+",       "15" = "Adult alpha",
+  "16" = "Fetal SOX4+/VIM+",       "17" = "Fetal acinar",
+  "18" = "Fetal VIM+",             "19" = "Child alpha",
+  "20" = "Child delta",             "21" = "Fetal duct",
+  "22" = "Adult alpha",             "23" = "Adult beta",
+  "24" = "Fetal other",             "25" = "Fetal SOX4+/VIM+/SERPINE2+",
+  "26" = "Fetal other",             "27" = "Fetal other",
+  "28" = "Fetal proliferating",     "29" = "Fetal proliferating",
+  "30" = "Adult acinar",            "31" = "Adult alpha",
+  "32" = "Fetal GCG+/INS+",        "33" = "Child beta"
+)
+human_combined <- RenameIdents(human_combined, integrated_cluster_labels)
+
+saveRDS(human_combined, "output/human_combined_integrated_labeled.rds")
+# human_combined <- readRDS("output/human_combined_integrated_labeled.rds")
+```
+
+---
+
+## 1.7 — Isolate Alpha Cell Subset
+
+> Fetal alpha cells (labeled "Fetal GCG+/INS+" in the integrated object)
+> are selected here. Manual refinement via CellSelector() is optional if the
+> automatic label captures unwanted clusters.
+
+```{r subset-alpha}
+# Isolate each developmental alpha population
+fetal_alpha <- subset(human_combined, idents = "Fetal GCG+/INS+")
+fetal_alpha  <- RenameIdents(fetal_alpha, "Fetal GCG+/INS+" = "Fetal alpha")
+
+child_alpha  <- subset(human_combined, idents = "Child alpha")
+adult_alpha  <- subset(human_combined, idents = "Adult alpha")
+
+# Combine cell barcodes and create the unified alpha object
+cells_keep          <- union(Cells(fetal_alpha), union(Cells(child_alpha), Cells(adult_alpha)))
+human_combined_alpha <- subset(human_combined, cells = cells_keep)
+
+# Rename fetal label to "Fetal alpha" in the combined object
+human_combined_alpha <- RenameIdents(human_combined_alpha, "Fetal GCG+/INS+" = "Fetal alpha")
+
+# Enforce order for downstream comparisons
+Idents(human_combined_alpha) <- factor(
+  Idents(human_combined_alpha),
+  levels = c("Fetal alpha", "Child alpha", "Adult alpha")
+)
+
+saveRDS(human_combined_alpha, "output/human_combined_alpha.rds")
+# human_combined_alpha <- readRDS("output/human_combined_alpha.rds")
+```
+
+---
+---
+
+# Part 2 — isletToolkit Functions
+
+> All functions below are designed to be reusable and dataset-agnostic.
+> While developed for alpha cell maturation, they accept any labeled Seurat
+> object and gene lists. These functions constitute the isletToolkit package.
+
+---
+
+## FUNCTION DEFINITIONS
+
+### `getSubsetDEG()`
+
+Performs pairwise DE testing between user-specified cell identity groups within
+a Seurat object. Returns full DE results, significantly upregulated gene sets,
+and annotated data frames ready for volcano plotting.
+
+```{r fn-getSubsetDEG}
+#' Pairwise Differential Expression Between Cell Identity Groups
+#'
+#' @param seurat_obj  A Seurat object with Idents() set to the cell-type/stage labels of interest.
+#' @param comparisons A named list of comparison pairs, each with elements 'ident.1' and 'ident.2'.
+#'                    ident.1 is the "foreground" group (positive log2FC = upregulated in ident.1).
+#'                    Default: all pairwise combinations of "Fetal alpha", "Child alpha", "Adult alpha".
+#' @param logfc_threshold Minimum absolute log2 fold change for significance (default: 0.5).
+#' @param padj_threshold  Adjusted p-value cutoff (default: 0.05).
+#' @param top_n_label     Number of top up/down genes to flag for volcano labels (default: 10).
+#'
+#' @return A named list with three elements per comparison:
+#'   - de_results:    Full (unfiltered) FindMarkers output, ordered by descending log2FC.
+#'   - sig_up:        Significantly upregulated genes (log2FC > logfc_threshold, padj < padj_threshold).
+#'   - sig_down:      Significantly downregulated genes.
+#'   - volcano_data:  Annotated data frame with 'diffexpressed' and 'delabel' columns for plotting.
+
+getSubsetDEG <- function(seurat_obj,
+                         comparisons     = NULL,
+                         logfc_threshold = 0.5,
+                         padj_threshold  = 0.05,
+                         top_n_label     = 10) {
+
+  # Default: all pairwise comparisons in order Fetal → Child → Adult
+  if (is.null(comparisons)) {
+    comparisons <- list(
+      child_vs_fetal = list(ident.1 = "Child alpha", ident.2 = "Fetal alpha"),
+      adult_vs_child = list(ident.1 = "Adult alpha", ident.2 = "Child alpha"),
+      adult_vs_fetal = list(ident.1 = "Adult alpha", ident.2 = "Fetal alpha")
+    )
+  }
+
+  all_results <- list()
+
+  for (comp_name in names(comparisons)) {
+    comp    <- comparisons[[comp_name]]
+    ident_1 <- comp$ident.1
+    ident_2 <- comp$ident.2
+    message("Running DE: ", ident_1, " vs. ", ident_2)
+
+    # Subset to only the two groups being compared (avoids influence of other populations)
+    cells_1  <- WhichCells(seurat_obj, idents = ident_1)
+    cells_2  <- WhichCells(seurat_obj, idents = ident_2)
+    sub_obj  <- subset(seurat_obj, cells = c(cells_1, cells_2))
+
+    # Run FindMarkers (Wilcoxon rank-sum; Seurat default)
+    de_full <- FindMarkers(
+      object          = sub_obj,
+      ident.1         = ident_1,
+      ident.2         = ident_2,
+      only.pos        = FALSE  # retrieve both up- and downregulated genes
+    )
+
+    # Order by descending log2FC
+    de_full <- de_full[order(-de_full$avg_log2FC), ]
+
+    # --- Significant subsets ---
+    sig_up   <- subset(de_full, avg_log2FC >  logfc_threshold & p_val_adj < padj_threshold)
+    sig_down <- subset(de_full, avg_log2FC < -logfc_threshold & p_val_adj < padj_threshold)
+    sig_down <- sig_down[order(sig_down$avg_log2FC), ]  # order ascending for downregulated
+
+    # --- Build annotated data frame for volcano plot ---
+    de_up   <- subset(de_full, avg_log2FC > 0)
+    de_down <- subset(de_full, avg_log2FC < 0)
+    de_down <- de_down[order(de_down$avg_log2FC), ]
+
+    de_up$regulation   <- "Upregulated"
+    de_down$regulation <- "Downregulated"
+    volcano_df         <- rbind(de_up, de_down)
+
+    # Classification column (uses raw p_val to match original implementation)
+    volcano_df$diffexpressed <- ifelse(
+      volcano_df$avg_log2FC > 0 & volcano_df$p_val < 0.05, "Upregulated",
+      ifelse(
+        volcano_df$avg_log2FC < 0 & volcano_df$p_val < 0.05, "Downregulated",
+        "Not significant"
+      )
+    )
+
+    # Label the top N up and top N down genes by name
+    top_up_genes   <- rownames(sig_up)[seq_len(min(top_n_label, nrow(sig_up)))]
+    top_down_genes <- rownames(sig_down)[seq_len(min(top_n_label, nrow(sig_down)))]
+    volcano_df$delabel <- ifelse(
+      rownames(volcano_df) %in% c(top_up_genes, top_down_genes),
+      rownames(volcano_df),
+      NA
+    )
+
+    # Store results for this comparison
+    all_results[[comp_name]] <- list(
+      de_results   = de_full,
+      sig_up       = sig_up,
+      sig_down     = sig_down,
+      volcano_data = volcano_df
+    )
+
+    message(sprintf(
+      "  -> Total DEGs: %d | Sig up: %d | Sig down: %d",
+      nrow(de_full), nrow(sig_up), nrow(sig_down)
+    ))
+  }
+
+  return(all_results)
+}
+```
+
+---
+
+### `plotVolcano()`
+
+Generates a publication-quality volcano plot for a single DE comparison.
+
+```{r fn-plotVolcano}
+#' Volcano Plot for Differential Expression Results
+#'
+#' @param volcano_df A data frame produced by getSubsetDEG() (the 'volcano_data' element),
+#'                   containing columns: avg_log2FC, p_val, diffexpressed, delabel.
+#' @param title      Plot title string.
+#' @param xlim       Numeric vector of length 2 for x-axis limits (default: c(-8, 8)).
+#' @param ylim       Numeric vector of length 2 for y-axis limits (default: c(0, 140)).
+#' @param top_n      Number of top genes to label (overrides labels already in 'delabel'; set NULL to use existing).
+#'
+#' @return A ggplot object.
+
+plotVolcano <- function(volcano_df,
+                        title = "Volcano Plot",
+                        xlim  = c(-8, 8),
+                        ylim  = c(0, 140),
+                        top_n = NULL) {
+
+  # Allow override of top_n labels if desired
+  if (!is.null(top_n)) {
+    sig_up_genes   <- rownames(volcano_df)[volcano_df$diffexpressed == "Upregulated"]
+    sig_down_genes <- rownames(volcano_df)[volcano_df$diffexpressed == "Downregulated"]
+    top_up         <- head(sig_up_genes,   top_n)
+    top_down       <- head(sig_down_genes, top_n)
+    volcano_df$delabel <- ifelse(
+      rownames(volcano_df) %in% c(top_up, top_down),
+      rownames(volcano_df), NA
+    )
+  }
+
+  ggplot(data  = volcano_df,
+         aes(x = avg_log2FC, y = -log10(p_val),
+             col = diffexpressed, label = delabel)) +
+    geom_point(size = 1) +
+    scale_color_manual(
+      name   = "Expression",
+      values = c("Downregulated"   = "#00AFBB",
+                 "Not significant" = "gray50",
+                 "Upregulated"     = "#bb0c00")
+    ) +
+    coord_cartesian(ylim = ylim, xlim = xlim) +
+    scale_x_continuous(breaks = seq(-20, 12, 2)) +
+    labs(
+      title = title,
+      x     = expression("log"[2] * " Fold Change"),
+      y     = expression("-log"[10] * "p-value"),
+      color = "Expression"
+    ) +
+    geom_text_repel(
+      color          = "black",
+      max.overlaps   = 50,
+      box.padding    = 1,
+      point.padding  = 0.7,
+      segment.color  = "gray50",
+      size           = 3,
+      force          = 2
+    ) +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      panel.grid       = element_blank(),
+      axis.line        = element_line(color = "black")
+    )
+}
+```
+
+---
+
+### `calcCoexpression()`
+
+Computes a Pearson gene-gene correlation matrix on a user-specified gene set,
+converts to a long-format edge list, removes self- and duplicate pairs, and
+returns strongly correlated pairs above a threshold. Gene input is flexible —
+users can supply significantly upregulated DEGs, the full gene set, or any
+custom list.
+
+```{r fn-calcCoexpression}
+#' Calculate Gene-Gene Pearson Co-expression from a Seurat Object
+#'
+#' @param seurat_obj   A Seurat object. Can be a full object or a pairwise subset
+#'                     (as produced internally by getSubsetDEG).
+#' @param genes        A character vector of gene names to calculate co-expression on.
+#'                     Can be: significantly upregulated DEGs (rownames of sig_up),
+#'                     the full gene set (rownames(seurat_obj)), or any custom list.
+#'                     Genes not found in the object are silently dropped.
+#' @param r_threshold  Minimum Pearson R for a gene pair to be retained (default: 0.5).
+#' @param assay        Assay to extract normalized expression from (default: "RNA").
+#' @param layer        Layer to use within the assay (default: "data" = log-normalized).
+#'
+#' @return A data frame of gene pairs with columns Gene1, Gene2, Correlation,
+#'         sorted by descending Correlation, filtered to R >= r_threshold.
+
+calcCoexpression <- function(seurat_obj,
+                             genes,
+                             r_threshold = 0.5,
+                             assay       = "RNA",
+                             layer       = "data") {
+
+  # Extract normalized expression matrix
+  expr_matrix <- GetAssayData(seurat_obj, assay = assay, layer = layer)
+  expr_matrix <- as.matrix(expr_matrix)
+
+  # Retain only genes that exist in the object
+  valid_genes <- intersect(genes, rownames(expr_matrix))
+  dropped     <- setdiff(genes, rownames(expr_matrix))
+  if (length(dropped) > 0) {
+    message(sprintf("Dropped %d genes not found in object: %s%s",
+                    length(dropped),
+                    paste(head(dropped, 5), collapse = ", "),
+                    if (length(dropped) > 5) "..." else ""))
+  }
+
+  if (length(valid_genes) < 2) {
+    stop("Fewer than 2 valid genes found. Cannot compute correlation.")
+  }
+
+  # Subset expression matrix to the gene list of interest
+  expr_subset <- expr_matrix[valid_genes, , drop = FALSE]
+
+  message(sprintf("Computing Pearson correlation on %d genes x %d cells ...",
+                  nrow(expr_subset), ncol(expr_subset)))
+
+  # Compute the full Pearson correlation matrix (genes x genes)
+  cor_matrix <- cor(t(expr_subset), method = "pearson")
+
+  # Convert symmetric matrix to long-format edge list
+  cor_df           <- as.data.frame(as.table(cor_matrix))
+  colnames(cor_df) <- c("Gene1", "Gene2", "Correlation")
+
+  # Remove self-pairs (Gene1 == Gene2) and duplicate pairs (A:B == B:A)
+  cor_df <- cor_df[cor_df$Gene1 != cor_df$Gene2, ]
+  cor_df <- cor_df[!duplicated(t(apply(cor_df[, 1:2], 1, sort))), ]
+
+  # Remove NAs and sort by descending correlation
+  cor_df <- na.omit(cor_df)
+  cor_df <- cor_df[order(-cor_df$Correlation), ]
+
+  # Filter to strong correlations
+  cor_df_filtered <- cor_df[cor_df$Correlation >= r_threshold, ]
+
+  message(sprintf("Total pairs: %d | Pairs with R >= %s: %d",
+                  nrow(cor_df), r_threshold, nrow(cor_df_filtered)))
+
+  return(cor_df_filtered)
+}
+```
+
+---
+
+### `getFunctionalModules()`
+
+Builds an undirected weighted co-expression network and partitions it into
+functional gene modules using the Leiden community detection algorithm.
+
+```{r fn-getFunctionalModules}
+#' Build Co-expression Network and Detect Functional Modules via Leiden
+#'
+#' @param cor_df     A data frame of gene pairs with a 'Correlation' column
+#'                   (output of calcCoexpression()).
+#' @param threshold  Additional Pearson R cutoff applied at network construction.
+#'                   Allows iterative refinement without re-running calcCoexpression()
+#'                   (default: 0.9; must be >= the r_threshold used in calcCoexpression).
+#' @param resolution Leiden resolution parameter. Higher values produce more,
+#'                   smaller modules (default: 1.0).
+#'
+#' @return A named list:
+#'   - module_mapping: Data frame with columns Gene and Module (e.g., "Module_1").
+#'   - graph:          The igraph object.
+#'   - leiden_obj:     Raw Leiden clustering result.
+
+getFunctionalModules <- function(cor_df, threshold = 0.9, resolution = 1.0) {
+
+  # Filter to the desired threshold and format for igraph
+  # igraph expects columns 1 and 2 as node pairs; additional columns become edge attributes
+  edges_df <- cor_df %>%
+    dplyr::filter(Correlation >= threshold) %>%
+    dplyr::select(Gene1, Gene2, weight = Correlation)
+
+  message(sprintf("Input pairs: %d | Pairs after R >= %s: %d",
+                  nrow(cor_df), threshold, nrow(edges_df)))
+
+  if (nrow(edges_df) == 0) {
+    stop("No edges remain after filtering. Try a lower threshold.")
+  }
+
+  # Build undirected weighted graph
+  # Pearson correlation is bidirectional, so Gene A:B == Gene B:A
+  g <- igraph::graph_from_data_frame(edges_df, directed = FALSE)
+
+  # Leiden community detection (mathematically guaranteed well-connected communities)
+  # Edge weights (correlations) inform cluster assignment
+  leiden_res <- igraph::cluster_leiden(
+    g,
+    objective_function  = "modularity",
+    weights             = igraph::E(g)$weight,
+    resolution_parameter = resolution
+  )
+
+  # Extract clean Gene → Module mapping
+  module_df <- data.frame(
+    Gene   = leiden_res$names,
+    Module = paste0("Module_", leiden_res$membership)
+  ) %>%
+    dplyr::arrange(Module)
+
+  message("Modules detected: ", length(unique(module_df$Module)))
+  print(table(module_df$Module))
+
+  return(list(
+    module_mapping = module_df,
+    graph          = g,
+    leiden_obj     = leiden_res
+  ))
+}
+```
+
+---
+
+### `plotCoexpressionNetwork()`
+
+Visualizes the co-expression network colored by Leiden module membership.
+
+```{r fn-plotCoexpressionNetwork}
+#' Visualize Co-expression Network Colored by Module
+#'
+#' @param modules_result Output list from getFunctionalModules().
+#' @param title          Plot title string.
+#'
+#' @return A ggplot/ggraph object.
+
+plotCoexpressionNetwork <- function(modules_result, title = "Co-expression Modules") {
+
+  g <- modules_result$graph
+
+  # Attach module membership as a node attribute for coloring
+  igraph::V(g)$module <- as.factor(modules_result$leiden_obj$membership)
+
+  ggraph(g, layout = "fr") +
+    geom_edge_link(aes(width = weight), alpha = 0.3, color = "gray50") +
+    scale_edge_width(range = c(0.5, 2)) +
+    geom_node_point(aes(color = module), size = 5) +
+    geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+    theme_void() +
+    labs(title = title, color = "Leiden Module")
+}
+```
+
+---
+
+### `runModuleORA()`
+
+Performs GO over-representation analysis (ORA) on genes from a specified
+co-expression module, and optionally extracts genes overlapping with a
+named biological pathway.
+
+```{r fn-runModuleORA}
+#' GO Over-Representation Analysis on a Co-expression Module
+#'
+#' @param module_mapping A data frame with columns Gene and Module
+#'                       (the 'module_mapping' element from getFunctionalModules()).
+#' @param module_id      String specifying which module to analyze (e.g., "Module_5").
+#' @param ont            GO ontology: "BP" (Biological Process), "MF", or "CC" (default: "BP").
+#' @param padj_method    Multiple testing correction method (default: "BH").
+#' @param pval_cutoff    Adjusted p-value threshold (default: 0.05).
+#' @param pathway_name   Optional string. If provided, the function extracts the genes
+#'                       from the ORA result that overlap with this specific GO term.
+#'
+#' @return A named list:
+#'   - ego_result:    The enrichGO result object (compatible with dotplot(), barplot(), etc.).
+#'   - ego_df:        The result as a plain data frame.
+#'   - pathway_genes: (if pathway_name supplied) Character vector of overlapping genes.
+
+runModuleORA <- function(module_mapping,
+                         module_id    = "Module_1",
+                         ont          = "BP",
+                         padj_method  = "BH",
+                         pval_cutoff  = 0.05,
+                         pathway_name = NULL) {
+
+  # Extract genes belonging to the specified module
+  module_genes <- module_mapping %>%
+    dplyr::filter(Module == module_id) %>%
+    dplyr::pull(Gene)
+
+  if (length(module_genes) == 0) {
+    stop("No genes found for module: ", module_id,
+         ". Available modules: ", paste(unique(module_mapping$Module), collapse = ", "))
+  }
+
+  message(sprintf("Running ORA on %s (%d genes) ...", module_id, length(module_genes)))
+
+  # Run GO enrichment (using gene symbols directly)
+  ego <- clusterProfiler::enrichGO(
+    gene          = module_genes,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",
+    ont           = ont,
+    pAdjustMethod = padj_method,
+    pvalueCutoff  = pval_cutoff
+  )
+
+  ego_df <- as.data.frame(ego)
+  message(sprintf("Enriched GO terms found: %d", nrow(ego_df)))
+
+  out <- list(ego_result = ego, ego_df = ego_df, pathway_genes = NULL)
+
+  # Optional: extract overlapping genes for a specific pathway of interest
+  if (!is.null(pathway_name)) {
+    matching_row <- ego_df %>% dplyr::filter(Description == pathway_name)
+
+    if (nrow(matching_row) == 0) {
+      warning("Pathway '", pathway_name, "' not found in ORA results. ",
+              "Check ego_df$Description for available terms.")
+    } else {
+      raw_gene_string    <- matching_row$geneID[1]
+      pathway_genes      <- stringr::str_split(raw_gene_string, "/")[[1]]
+      out$pathway_genes  <- pathway_genes
+      message(sprintf("Genes in pathway '%s': %s", pathway_name,
+                      paste(pathway_genes, collapse = ", ")))
+    }
+  }
+
+  return(out)
+}
+```
+
+---
+
+### `runMotifEnrichment()`
+
+Runs RcisTarget motif enrichment on genes from a specified module to identify
+high-confidence transcription factor regulators, ranked by Normalized Enrichment
+Score (NES).
+
+```{r fn-runMotifEnrichment}
+#' TF Motif Enrichment via RcisTarget on a Co-expression Module
+#'
+#' @param module_mapping A data frame with columns Gene and Module
+#'                       (the 'module_mapping' element from getFunctionalModules()).
+#' @param module_id      String specifying which module to analyze (e.g., "Module_3").
+#' @param motif_rankings A loaded RcisTarget rankings object. Import with:
+#'                       RcisTarget::importRankings("path/to/hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather")
+#'                       Download from: https://resources.aertslab.org/cistarget/databases/
+#' @param motif_annot    Motif annotation object. Load with:
+#'                       data(motifAnnotations_hgnc_v9)
+#'
+#' @return A named list:
+#'   - full_table: Complete motif enrichment data frame.
+#'   - top_tfs:    Filtered, NES-sorted data frame of high-confidence TF candidates
+#'                 (columns: TF_highConf, NES, motif, enrichedGenes).
+
+runMotifEnrichment <- function(module_mapping,
+                               module_id    = "Module_1",
+                               motif_rankings,
+                               motif_annot) {
+
+  # Extract genes belonging to the specified module
+  module_genes <- module_mapping %>%
+    dplyr::filter(Module == module_id) %>%
+    dplyr::pull(Gene)
+
+  if (length(module_genes) == 0) {
+    stop("No genes found for module: ", module_id)
+  }
+
+  message(sprintf("Running RcisTarget motif enrichment on %s (%d genes) ...",
+                  module_id, length(module_genes)))
+
+  # cisTarget() requires a named list of gene vectors
+  gene_list <- list(module_genes)
+  names(gene_list) <- module_id
+
+  # Run enrichment: computes AUC and annotates with TF motif database
+  motif_table <- RcisTarget::cisTarget(
+    geneSets   = gene_list,
+    rankings   = motif_rankings,
+    motifAnnot = motif_annot
+  )
+
+  # Extract high-confidence TF candidates, sorted by NES (highest = strongest enrichment)
+  top_tfs <- motif_table %>%
+    dplyr::arrange(desc(NES)) %>%
+    dplyr::select(TF_highConf, NES, motif, enrichedGenes) %>%
+    dplyr::filter(TF_highConf != "")  # drop motifs without a known high-confidence TF
+
+  message(sprintf("High-confidence TF candidates found: %d", nrow(top_tfs)))
+
+  return(list(
+    full_table = motif_table,
+    top_tfs    = top_tfs
+  ))
+}
+```
+
+---
+
+### `plotTFNetwork()`
+
+Constructs and visualizes a directed regulatory network for a single candidate
+TF, with the TF as a central hub and its RcisTarget-enriched target genes as
+spoke nodes.
+
+```{r fn-plotTFNetwork}
+#' Plot Directed Regulatory Network for a Candidate TF
+#'
+#' @param top_tfs_df     The 'top_tfs' data frame from runMotifEnrichment().
+#' @param tf_name        String matching (partial match via grepl) the TF_highConf column.
+#'                       The first matching row is used.
+#' @param master_tf_label Display name for the central TF node (default: same as tf_name).
+#'
+#' @return A ggplot/ggraph object.
+
+plotTFNetwork <- function(top_tfs_df, tf_name, master_tf_label = NULL) {
+
+  if (is.null(master_tf_label)) master_tf_label <- tf_name
+
+  # Find the first matching row for the specified TF
+  target_row <- top_tfs_df %>%
+    dplyr::filter(grepl(tf_name, TF_highConf, fixed = TRUE)) %>%
+    dplyr::slice(1)
+
+  if (nrow(target_row) == 0) {
+    stop("TF '", tf_name, "' not found in top_tfs_df$TF_highConf. ",
+         "Available TFs: ", paste(head(unique(top_tfs_df$TF_highConf), 10), collapse = ", "))
+  }
+
+  # Extract and clean target gene names
+  # RcisTarget outputs enrichedGenes as a semicolon-delimited string
+  target_genes <- stringr::str_split(target_row$enrichedGenes, ";")[[1]]
+  target_genes <- stringr::str_trim(target_genes)
+
+  # Build directed edge list: TF → each target gene
+  edges <- data.frame(from = master_tf_label, to = target_genes)
+
+  # Construct directed igraph object
+  tf_graph <- igraph::graph_from_data_frame(edges, directed = TRUE)
+
+  # Assign node type for visual differentiation
+  igraph::V(tf_graph)$type <- ifelse(
+    igraph::V(tf_graph)$name == master_tf_label, "Master TF", "Target Gene"
+  )
+
+  # Plot
+  ggraph(tf_graph, layout = "stress") +
+    geom_edge_link(
+      edge_colour = "gray60",
+      alpha       = 0.6,
+      arrow       = grid::arrow(length = unit(3, "mm"), type = "closed"),
+      end_cap     = ggraph::circle(4, "mm")
+    ) +
+    geom_node_point(aes(color = type, size = type)) +
+    geom_node_text(aes(label = name), repel = TRUE, fontface = "bold", size = 4) +
+    scale_color_manual(values = c("Master TF" = "#E41A1C", "Target Gene" = "#377EB8")) +
+    scale_size_manual(values  = c("Master TF" = 12, "Target Gene" = 6)) +
+    theme_void() +
+    ggtitle(paste("Regulatory Network:", master_tf_label)) +
+    theme(
+      legend.position  = "bottom",
+      plot.title       = element_text(hjust = 0.5, face = "bold")
+    )
+}
+```
+
+---
+---
+
+# Part 2 — Execution: Running the Full Downstream Pipeline
+
+## 2.1 — Differential Expression Across Developmental Stages
+
+```{r run-DE}
+# Load integrated alpha subset if resuming
+# human_combined_alpha <- readRDS("output/human_combined_alpha.rds")
+
+# --- Run pairwise DE ---
+# Defaults test: Child vs Fetal, Adult vs Child, Adult vs Fetal
+# To analyze a different subset, change 'comparisons' accordingly, e.g.:
+#   comparisons = list(adult_vs_child = list(ident.1 = "Adult beta", ident.2 = "Child beta"))
+
+de_results <- getSubsetDEG(
+  seurat_obj      = human_combined_alpha,
+  logfc_threshold = 0.5,
+  padj_threshold  = 0.05,
+  top_n_label     = 10
+)
+
+# --- Save DE results ---
+write.csv(de_results$child_vs_fetal$de_results,
+          "output/DE_Child_vs_Fetal_full.csv")
+write.csv(de_results$adult_vs_child$de_results,
+          "output/DE_Adult_vs_Child_full.csv")
+write.csv(de_results$adult_vs_fetal$de_results,
+          "output/DE_Adult_vs_Fetal_full.csv")
+
+write.csv(de_results$child_vs_fetal$sig_up,
+          "output/DE_Child_vs_Fetal_sigUP.csv")
+write.csv(de_results$adult_vs_child$sig_up,
+          "output/DE_Adult_vs_Child_sigUP.csv")
+write.csv(de_results$adult_vs_fetal$sig_up,
+          "output/DE_Adult_vs_Fetal_sigUP.csv")
+```
+
+## 2.2 — Volcano Plots
+
+```{r plot-volcanoes, fig.width=8, fig.height=6}
+# Child vs Fetal
+plotVolcano(
+  de_results$child_vs_fetal$volcano_data,
+  title = "Volcano Plot: Child alpha vs Fetal alpha"
+)
+
+# Adult vs Child
+plotVolcano(
+  de_results$adult_vs_child$volcano_data,
+  title = "Volcano Plot: Adult alpha vs Child alpha"
+)
+
+# Adult vs Fetal
+plotVolcano(
+  de_results$adult_vs_fetal$volcano_data,
+  title = "Volcano Plot: Adult alpha vs Fetal alpha"
+)
+```
+
+---
+
+## 2.3 — Gene-Gene Co-expression Analysis
+
+```{r run-coexpression}
+# --- Prepare pairwise cell subsets for correlation ---
+# Correlation is computed within each paired comparison to capture
+# co-expression dynamics specific to that transition.
+
+fetal_cells <- WhichCells(human_combined_alpha, idents = "Fetal alpha")
+child_cells <- WhichCells(human_combined_alpha, idents = "Child alpha")
+adult_cells <- WhichCells(human_combined_alpha, idents = "Adult alpha")
+
+alpha_fetal.child <- subset(human_combined_alpha, cells = union(fetal_cells, child_cells))
+alpha_child.adult <- subset(human_combined_alpha, cells = union(child_cells, adult_cells))
+alpha_fetal.adult <- subset(human_combined_alpha, cells = union(fetal_cells, adult_cells))
+
+# Switch to RNA assay for expression extraction (integrated assay is for dimensionality reduction only)
+DefaultAssay(alpha_fetal.child) <- "RNA"
+DefaultAssay(alpha_child.adult) <- "RNA"
+DefaultAssay(alpha_fetal.adult) <- "RNA"
+
+# --- Calculate co-expression ---
+# Input genes: significantly upregulated DEGs from each comparison.
+# Users can supply any gene list here (e.g., rownames(human_combined_alpha) for all genes).
+
+cor_fetal.child <- calcCoexpression(
+  seurat_obj  = alpha_fetal.child,
+  genes       = rownames(de_results$child_vs_fetal$sig_up),
+  r_threshold = 0.5
+)
+
+cor_child.adult <- calcCoexpression(
+  seurat_obj  = alpha_child.adult,
+  genes       = rownames(de_results$adult_vs_child$sig_up),
+  r_threshold = 0.5
+)
+
+cor_fetal.adult <- calcCoexpression(
+  seurat_obj  = alpha_fetal.adult,
+  genes       = rownames(de_results$adult_vs_fetal$sig_up),
+  r_threshold = 0.5
+)
+
+# --- Save filtered correlation tables ---
+write.csv(cor_fetal.child, "output/Cor_R0.5_Child_vs_Fetal.csv", row.names = FALSE)
+write.csv(cor_child.adult, "output/Cor_R0.5_Adult_vs_Child.csv", row.names = FALSE)
+write.csv(cor_fetal.adult, "output/Cor_R0.5_Adult_vs_Fetal.csv", row.names = FALSE)
+```
+
+---
+
+## 2.4 — Co-expression Network Construction & Module Detection
+
+```{r run-modules}
+# Threshold at R >= 0.9 to define network edges (strong co-expressors only)
+# Adjust resolution to tune module granularity (higher = more, smaller modules)
+
+res_fetal.child <- getFunctionalModules(cor_fetal.child, threshold = 0.9, resolution = 1.0)
+res_child.adult <- getFunctionalModules(cor_child.adult, threshold = 0.9, resolution = 1.0)
+res_fetal.adult <- getFunctionalModules(cor_fetal.adult, threshold = 0.9, resolution = 1.0)
+
+# Save module assignments
+write.csv(res_fetal.child$module_mapping,
+          "output/Modules_Fetal_vs_Child.csv", row.names = FALSE)
+write.csv(res_child.adult$module_mapping,
+          "output/Modules_Child_vs_Adult.csv", row.names = FALSE)
+write.csv(res_fetal.adult$module_mapping,
+          "output/Modules_Fetal_vs_Adult.csv", row.names = FALSE)
+
+# Optionally save full network result objects for reloading
+saveRDS(res_fetal.child, "output/Network_Fetal_vs_Child.rds")
+saveRDS(res_child.adult, "output/Network_Child_vs_Adult.rds")
+saveRDS(res_fetal.adult, "output/Network_Fetal_vs_Adult.rds")
+
+# Reload if resuming:
+# res_fetal.child <- readRDS("output/Network_Fetal_vs_Child.rds")
+# res_child.adult <- readRDS("output/Network_Child_vs_Adult.rds")
+# res_fetal.adult <- readRDS("output/Network_Fetal_vs_Adult.rds")
+```
+
+## 2.5 — Visualize Co-expression Network
+
+```{r plot-network, fig.width=10, fig.height=8}
+plotCoexpressionNetwork(res_fetal.adult, title = "Adult vs Fetal — Co-expression Modules")
+plotCoexpressionNetwork(res_child.adult, title = "Adult vs Child — Co-expression Modules")
+plotCoexpressionNetwork(res_fetal.child, title = "Child vs Fetal — Co-expression Modules")
+```
+
+---
+
+## 2.6 — Functional Enrichment (GO Over-Representation Analysis)
+
+```{r run-ORA}
+# --- Inspect module sizes first to select robust (large) modules ---
+table(res_fetal.adult$module_mapping$Module)
+table(res_child.adult$module_mapping$Module)
+table(res_fetal.child$module_mapping$Module)
+
+# --- Run ORA on modules of interest ---
+# Change module_id to target whichever module you wish to characterize.
+# Change pathway_name to extract overlapping genes for a specific GO term.
+
+ora_fetal.adult_m3 <- runModuleORA(
+  module_mapping = res_fetal.adult$module_mapping,
+  module_id      = "Module_3",
+  ont            = "BP",
+  pathway_name   = "noradrenergic neuron differentiation"  # set NULL to skip pathway extraction
+)
+
+# Visualize enriched terms
+dotplot(ora_fetal.adult_m3$ego_result) +
+  ggtitle("GO Enrichment — Adult vs Fetal Module 3") +
+  guides(size = guide_legend(override.aes = list(shape = 16, color = "#377EB8")))
+
+# Save ORA table
+write.csv(ora_fetal.adult_m3$ego_df,
+          "output/ORA_Fetal_vs_Adult_Module3.csv", row.names = FALSE)
+
+# View overlapping genes for the pathway of interest (if pathway_name was set)
+print(ora_fetal.adult_m3$pathway_genes)
+```
+
+---
+
+## 2.7 — TF Motif Enrichment (RcisTarget)
+
+```{r run-motif-setup}
+# --- Load the hg38 motif rankings database (download once; ~5 GB) ---
+# Download URL:
+# https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.genes_vs_motifs.rankings.feather
+
+# options(timeout = 1800)  # extend timeout for large download
+# download.file(
+#   url     = "https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.genes_vs_motifs.rankings.feather",
+#   destfile = "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather",
+#   mode    = "wb"
+# )
+
+# Load the database (required for every session)
+motifRankings_hg38 <- RcisTarget::importRankings(
+  "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather"
+)
+
+# Load motif-to-TF annotation
+data(motifAnnotations_hgnc_v9)
+```
+
+```{r run-motif-enrichment}
+# Run motif enrichment on module of interest
+# Repeat for each comparison/module as needed
+
+tf_result_fetal.adult_m3 <- runMotifEnrichment(
+  module_mapping = res_fetal.adult$module_mapping,
+  module_id      = "Module_3",
+  motif_rankings = motifRankings_hg38,
+  motif_annot    = motifAnnotations_hgnc_v9
+)
+
+# View top TF candidates
+View(tf_result_fetal.adult_m3$top_tfs)
+
+# Save results
+write.csv(tf_result_fetal.adult_m3$full_table,
+          "output/MotifEnrichment_Fetal_vs_Adult_Module3_full.csv", row.names = FALSE)
+write.csv(tf_result_fetal.adult_m3$top_tfs,
+          "output/MotifEnrichment_Fetal_vs_Adult_Module3_TFs.csv", row.names = FALSE)
+```
+
+---
+
+## 2.8 — Candidate TF Validation & Regulatory Network Visualization
+
+```{r validate-TF-expression, fig.width=10, fig.height=5}
+# --- Check expression of top TF candidates in the alpha Seurat object ---
+# Use DotPlot (% expressing + mean expression) and FeaturePlot (UMAP distribution)
+
+candidate_tfs <- c("GATA1", "GATA2", "GATA3", "ESRRA", "MAFF",
+                   "ESRRG", "ETV2", "ZNF611", "TGIF1")
+
+# Safety check: keep only TFs detected in the data
+tfs_in_data <- candidate_tfs[candidate_tfs %in% rownames(human_combined_alpha)]
+message(sprintf("Found %d / %d candidate TFs in data.", length(tfs_in_data), length(candidate_tfs)))
+
+# DotPlot: compare expression across developmental stages
+DotPlot(human_combined_alpha, features = tfs_in_data) +
+  coord_flip() +
+  theme_minimal() +
+  scale_color_gradient(low = "lightgrey", high = "#E41A1C") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold.italic")
+  )
+
+# FeaturePlot: UMAP expression map per TF
+FeaturePlot(
+  human_combined_alpha,
+  features = tfs_in_data,
+  ncol     = 3,
+  pt.size  = 0.5,
+  order    = TRUE
+)
+```
+
+```{r plot-TF-network, fig.width=10, fig.height=8}
+# --- Plot regulatory network for a specific top TF candidate ---
+# Change tf_name to the TF of interest from your top_tfs table.
+# master_tf_label sets the display name on the plot node.
+
+plotTFNetwork(
+  top_tfs_df     = tf_result_fetal.adult_m3$top_tfs,
+  tf_name        = "TGIF1",
+  master_tf_label = "TGIF1"
+)
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
